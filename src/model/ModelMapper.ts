@@ -40,6 +40,9 @@ export const ClusterMap: {
 
 // Remap the clusters from Model  to a more optimized form for direct access
 MatterModel.standard.clusters.forEach(cluster => {
+    if (cluster.id === undefined) {
+        return;
+    } // Skip clusters without an ID
     const aces = cluster.allAces;
     const clusterData: ClusterMapEntry = {
         clusterId: ClusterId(cluster.id),
