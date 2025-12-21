@@ -1,0 +1,8 @@
+{
+    "dependencyApiShas": {
+        "@matter-server/controller": "4de83a34f404b472a0c8f0151ee7e1bc4fc232e7",
+        "@matter-server/dashboard": "d7163c488819cacf468495fd4f1ccb78a80994e4"
+    },
+    "apiSha": "d7f1a7d376185b7b6025a4f363046053f38d170e",
+    "timestamp": "2025-12-21T17:10:17.541Z"
+}

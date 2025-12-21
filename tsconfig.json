@@ -1,15 +1,17 @@
 {
-    "compilerOptions": {
-        "strict": true,
-        "target": "es2022",
-        "module": "node16",
-        "moduleResolution": "node16",
-        "noImplicitAny": true,
-        "noImplicitOverride": true,
-        "outDir": "./dist",
-        "skipLibCheck": true
-    },
-    "include": [
-        "./src/**/*.ts"
+    "files": [],
+    "references": [
+        {
+            "path": "packages/tools"
+        },
+        {
+            "path": "packages/controller"
+        },
+        {
+            "path": "packages/dashboard"
+        },
+        {
+            "path": "packages/matter-server"
+        }
     ]
 }

@@ -1,0 +1,10 @@
+{
+    "extends": "../../tools/tsc/tsconfig.lib.json",
+    "compilerOptions": {
+        "types": ["globals"],
+        "experimentalDecorators": true,
+        "useDefineForClassFields": false,
+        "allowSyntheticDefaultImports": true
+    },
+    "references": []
+}

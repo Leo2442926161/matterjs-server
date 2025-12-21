@@ -1,0 +1,14 @@
+{
+    "extends": "../../tools/tsc/tsconfig.test.json",
+    "compilerOptions": {
+        "types": ["mocha", "node"]
+    },
+    "references": [
+        {
+            "path": "../../tools/src"
+        },
+        {
+            "path": "../src"
+        }
+    ]
+}
