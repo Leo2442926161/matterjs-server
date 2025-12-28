@@ -23,6 +23,26 @@ import {
 
 const TEST_TIMEOUT = 120_000; // 2 minutes for Matter commissioning
 
+/**
+ * Helper to wait for OnOff attribute update event.
+ */
+async function waitForOnOffUpdate(
+    client: MatterWebSocketClient,
+    nodeId: number,
+    expectedValue: boolean,
+): Promise<void> {
+    const event = await client.waitForEvent(
+        "attribute_updated",
+        data => {
+            const [eventNodeId, path] = data as [number, string, unknown];
+            return eventNodeId === nodeId && path === "1/6/0";
+        },
+        10_000,
+    );
+    const [, , value] = event.data as [number, string, boolean];
+    expect(value).to.equal(expectedValue);
+}
+
 describe("Integration Test", function () {
     this.timeout(TEST_TIMEOUT);
 
@@ -119,29 +139,65 @@ describe("Integration Test", function () {
     });
 
     it("should toggle light and receive attribute update", async function () {
-        // Helper to wait for OnOff attribute update
-        const waitForOnOffUpdate = async (expectedValue: boolean) => {
-            const event = await client.waitForEvent(
-                "attribute_updated",
-                data => {
-                    const [nodeId, path] = data as [number, string, unknown];
-                    return nodeId === commissionedNodeId && path === "1/6/0";
-                },
-                10_000,
-            );
-            const [, , value] = event.data as [number, string, boolean];
-            expect(value).to.equal(expectedValue);
-        };
-
         // Toggle ON
         client.clearEvents();
         await client.deviceCommand(commissionedNodeId, 1, 6, "toggle", {});
-        await waitForOnOffUpdate(true);
+        await waitForOnOffUpdate(client, commissionedNodeId, true);
 
         // Toggle OFF
         client.clearEvents();
         await client.deviceCommand(commissionedNodeId, 1, 6, "toggle", {});
-        await waitForOnOffUpdate(false);
+        await waitForOnOffUpdate(client, commissionedNodeId, false);
+    });
+
+    it("should persist node after server restart and still work", async function () {
+        // Close current client connection
+        await client.close();
+
+        // Stop the server
+        console.log("Stopping server for restart test...");
+        await killProcess(serverProcess);
+
+        // Wait a moment for cleanup
+        await new Promise(r => setTimeout(r, 2000));
+
+        // Restart the server with the same storage path
+        console.log("Restarting server...");
+        serverProcess = startServer(serverStoragePath);
+        await waitForPort(SERVER_PORT);
+        console.log("Server restarted");
+
+        // Reconnect WebSocket client
+        client = new MatterWebSocketClient(SERVER_WS_URL);
+        const serverInfo = await client.connect();
+        console.log("Reconnected to server, schema version:", serverInfo.schema_version);
+
+        // Verify the node is still there
+        const nodes = await client.startListening();
+        expect(nodes).to.be.an("array").with.lengthOf(1);
+
+        const node = nodes[0];
+        expect(Number(node.node_id)).to.equal(commissionedNodeId);
+        expect(node.available).to.be.true;
+
+        // Verify node attributes are preserved
+        expect(node.attributes["0/40/1"]).to.equal("Test Vendor");
+        expect(node.attributes["0/40/3"]).to.equal("Test Light");
+
+        // Wait for device to reconnect to the restarted server
+        await new Promise(r => setTimeout(r, 3000));
+
+        // Toggle ON and verify events still work
+        client.clearEvents();
+        await client.deviceCommand(commissionedNodeId, 1, 6, "toggle", {});
+        await waitForOnOffUpdate(client, commissionedNodeId, true);
+
+        // Toggle OFF
+        client.clearEvents();
+        await client.deviceCommand(commissionedNodeId, 1, 6, "toggle", {});
+        await waitForOnOffUpdate(client, commissionedNodeId, false);
+
+        console.log("Server restart test passed - node persisted and functional");
     });
 
     it("should decommission node", async function () {
