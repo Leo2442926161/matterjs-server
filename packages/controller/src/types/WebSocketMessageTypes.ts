@@ -186,6 +186,66 @@ export interface APICommands {
         };
         response: {};
     };
+    set_acl_entry: {
+        requestArgs: {
+            node_id: number | bigint;
+            entry: AccessControlEntry[];
+        };
+        response: AttributeWriteResult[] | null;
+    };
+    set_node_binding: {
+        requestArgs: {
+            node_id: number | bigint;
+            endpoint: number;
+            bindings: BindingTarget[];
+        };
+        response: AttributeWriteResult[] | null;
+    };
+}
+
+/**
+ * Access Control Entry structure for set_acl_entry command.
+ * Matches Python Matter Server's AccessControlEntryStruct.
+ */
+export interface AccessControlEntry {
+    /** 1=View, 3=Operate, 4=Manage, 5=Administer */
+    privilege: number;
+    /** 1=PASE, 2=CASE, 3=Group */
+    auth_mode: number;
+    /** List of subject NodeIds or GroupIds */
+    subjects: Array<number | bigint> | null;
+    /** Optional target restrictions */
+    targets: AccessControlTarget[] | null;
+}
+
+export interface AccessControlTarget {
+    cluster: number | null;
+    endpoint: number | null;
+    device_type: number | null;
+}
+
+/**
+ * Binding target structure for set_node_binding command.
+ * Matches Python Matter Server's TargetStruct.
+ */
+export interface BindingTarget {
+    /** Target node ID */
+    node: number | bigint | null;
+    /** Target group ID */
+    group: number | null;
+    /** Target endpoint */
+    endpoint: number | null;
+    /** Target cluster */
+    cluster: number | null;
+}
+
+export interface AttributeWriteResult {
+    path: {
+        endpoint_id: number;
+        cluster_id: number;
+        attribute_id: number;
+    };
+    status: number;
 }
 
 export interface ServerInfoMessage {

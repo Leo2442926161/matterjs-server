@@ -1,4 +1,13 @@
-import { AttributeId, camelize, ClusterBehavior, ClusterId, FabricIndex, Logger, Millis, NodeId } from "@matter/main";
+import {
+    AttributeId,
+    camelize,
+    ClusterBehavior,
+    ClusterId,
+    FabricIndex,
+    Logger,
+    Millis,
+    NodeId,
+} from "@matter/main";
 import { AggregatorEndpointDefinition } from "@matter/main/endpoints";
 import { ControllerCommissioningFlowOptions, DecodedAttributeReportValue } from "@matter/main/protocol";
 import { EndpointNumber, getClusterById, QrPairingCodeCodec } from "@matter/main/types";
@@ -216,6 +225,12 @@ export class WebSocketControllerHandler implements WebServerHandler {
                     break;
                 case "remove_matter_fabric":
                     result = await this.#handleRemoveMatterFabric(args);
+                    break;
+                case "set_acl_entry":
+                    result = await this.#handleSetAclEntry(args);
+                    break;
+                case "set_node_binding":
+                    result = await this.#handleSetNodeBinding(args);
                     break;
                 case "import_test_node":
                     result = await this.#handleImportTestNode(args);
@@ -540,6 +555,16 @@ export class WebSocketControllerHandler implements WebServerHandler {
         const { node_id, fabric_index } = args;
         await this.#commandHandler.removeFabric(NodeId(node_id), FabricIndex(fabric_index));
         return {};
+    }
+
+    async #handleSetAclEntry(args: ArgsOf<"set_acl_entry">): Promise<ResponseOf<"set_acl_entry">> {
+        const { node_id, entry } = args;
+        return await this.#commandHandler.setAclEntry(NodeId(node_id), entry);
+    }
+
+    async #handleSetNodeBinding(args: ArgsOf<"set_node_binding">): Promise<ResponseOf<"set_node_binding">> {
+        const { node_id, endpoint, bindings } = args;
+        return await this.#commandHandler.setNodeBinding(NodeId(node_id), EndpointNumber(endpoint), bindings);
     }
 
     async #handleImportTestNode(_args: ArgsOf<"import_test_node">): Promise<ResponseOf<"import_test_node">> {

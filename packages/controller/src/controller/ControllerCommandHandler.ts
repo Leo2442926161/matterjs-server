@@ -15,7 +15,13 @@ import {
     ServerAddress,
     ServerAddressUdp,
 } from "@matter/main";
-import { GeneralCommissioning, GeneralDiagnosticsCluster, OperationalCredentials } from "@matter/main/clusters";
+import {
+    AccessControl,
+    Binding,
+    GeneralCommissioning,
+    GeneralDiagnosticsCluster,
+    OperationalCredentials,
+} from "@matter/main/clusters";
 import {
     DecodedAttributeReportValue,
     DecodedEventReportValue,
@@ -24,7 +30,11 @@ import {
 } from "@matter/main/protocol";
 import {
     Attribute,
+    ClusterId,
     Command,
+    DeviceTypeId,
+    EndpointNumber,
+    GroupId,
     ManualPairingCodeCodec,
     QrPairingCodeCodec,
     StatusResponseError,
@@ -65,6 +75,12 @@ import {
     WriteAttributeByIdRequest,
     WriteAttributeRequest,
 } from "../types/CommandHandler.js";
+import {
+    AccessControlEntry,
+    AccessControlTarget,
+    AttributeWriteResult,
+    BindingTarget,
+} from "../types/WebSocketMessageTypes.js";
 
 const logger = Logger.get("ControllerCommandHandler");
 
@@ -705,5 +721,148 @@ export class ControllerCommandHandler {
             throw new Error("GeneralCommissioning.Cluster not found");
         }
         return client.removeFabric({ fabricIndex });
+    }
+
+    /**
+     * Set Access Control List entries on a node.
+     * Writes to the ACL attribute on the AccessControl cluster (endpoint 0).
+     */
+    async setAclEntry(nodeId: NodeId, entries: AccessControlEntry[]): Promise<AttributeWriteResult[] | null> {
+        const node = this.getNode(nodeId);
+        if (node === undefined) {
+            throw new Error("Node not found");
+        }
+
+        const client = node.getRootClusterClient(AccessControl.Cluster);
+        if (client === undefined) {
+            throw new Error("AccessControl cluster not found");
+        }
+
+        // Get the fabric index for this controller's fabric on the target node
+        const fabricIndex = await this.#getNodeFabricIndex(node);
+
+        // Convert from WebSocket format to Matter.js format
+        const aclEntries: AccessControl.AccessControlEntry[] = entries.map(entry => ({
+            privilege: entry.privilege as AccessControl.AccessControlEntryPrivilege,
+            authMode: entry.auth_mode as AccessControl.AccessControlEntryAuthMode,
+            subjects: entry.subjects?.map(s => NodeId(BigInt(s))) ?? null,
+            targets:
+                entry.targets?.map((t: AccessControlTarget) => ({
+                    cluster: t.cluster !== null ? ClusterId(t.cluster) : null,
+                    endpoint: t.endpoint !== null ? EndpointNumber(t.endpoint) : null,
+                    deviceType: t.device_type !== null ? DeviceTypeId(t.device_type) : null,
+                })) ?? null,
+            fabricIndex,
+        }));
+
+        logger.info("Setting ACL entries", aclEntries);
+
+        try {
+            await client.setAclAttribute(aclEntries);
+            return [
+                {
+                    path: {
+                        endpoint_id: 0,
+                        cluster_id: AccessControl.Cluster.id,
+                        attribute_id: 0, // ACL attribute ID
+                    },
+                    status: 0,
+                },
+            ];
+        } catch (error) {
+            StatusResponseError.accept(error);
+            return [
+                {
+                    path: {
+                        endpoint_id: 0,
+                        cluster_id: AccessControl.Cluster.id,
+                        attribute_id: 0,
+                    },
+                    status: error.code,
+                },
+            ];
+        }
+    }
+
+    /**
+     * Get the fabric index for the current controller's fabric on a node.
+     */
+    async #getNodeFabricIndex(node: PairedNode): Promise<FabricIndex> {
+        const opCredClient = node.getRootClusterClient(OperationalCredentials.Cluster);
+        if (opCredClient === undefined) {
+            throw new Error("OperationalCredentials cluster not found");
+        }
+        const fabrics = await opCredClient.getFabricsAttribute();
+        const controllerFabricId = this.#controller.fabric.fabricId;
+        const fabric = fabrics.find(f => f.fabricId === controllerFabricId);
+        if (fabric === undefined) {
+            throw new Error("Controller fabric not found on node");
+        }
+        return fabric.fabricIndex;
+    }
+
+    /**
+     * Set bindings on a specific endpoint of a node.
+     * Writes to the Binding attribute on the Binding cluster.
+     */
+    async setNodeBinding(
+        nodeId: NodeId,
+        endpointId: EndpointNumber,
+        bindings: BindingTarget[],
+    ): Promise<AttributeWriteResult[] | null> {
+        const node = this.getNode(nodeId);
+        if (node === undefined) {
+            throw new Error("Node not found");
+        }
+
+        const endpoint = node.getDeviceById(endpointId);
+        if (endpoint === undefined) {
+            throw new Error("Endpoint not found");
+        }
+
+        const client = endpoint.getClusterClientById(Binding.Cluster.id);
+        if (client === undefined) {
+            throw new Error("Binding cluster not found on endpoint");
+        }
+
+        // Get the fabric index for this controller's fabric on the target node
+        const fabricIndex = await this.#getNodeFabricIndex(node);
+
+        // Convert from WebSocket format to Matter.js format
+        const bindingEntries: Binding.Target[] = bindings.map(binding => ({
+            node: binding.node !== null ? NodeId(BigInt(binding.node)) : undefined,
+            group: binding.group !== null ? GroupId(binding.group) : undefined,
+            endpoint: binding.endpoint !== null ? EndpointNumber(binding.endpoint) : undefined,
+            cluster: binding.cluster !== null ? ClusterId(binding.cluster) : undefined,
+            fabricIndex,
+        }));
+
+        logger.info("Setting bindings on endpoint", endpointId, bindingEntries);
+
+        try {
+            await client.attributes.binding.set(bindingEntries);
+            return [
+                {
+                    path: {
+                        endpoint_id: endpointId,
+                        cluster_id: Binding.Cluster.id,
+                        attribute_id: 0, // Binding attribute ID
+                    },
+                    status: 0,
+                },
+            ];
+        } catch (error) {
+            StatusResponseError.accept(error);
+            return [
+                {
+                    path: {
+                        endpoint_id: endpointId,
+                        cluster_id: Binding.Cluster.id,
+                        attribute_id: 0,
+                    },
+                    status: error.code,
+                },
+            ];
+        }
     }
 }
