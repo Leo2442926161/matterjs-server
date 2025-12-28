@@ -1,23 +1,14 @@
-import {
-    AttributeId,
-    camelize,
-    ClusterBehavior,
-    ClusterId,
-    FabricIndex,
-    Logger,
-    Millis,
-    NodeId,
-} from "@matter/main";
 import { ObserverGroup } from "@matter/general";
+import { AttributeId, camelize, ClusterBehavior, ClusterId, FabricIndex, Logger, Millis, NodeId } from "@matter/main";
 import { AggregatorEndpointDefinition } from "@matter/main/endpoints";
 import { ControllerCommissioningFlowOptions } from "@matter/main/protocol";
 import { EndpointNumber, getClusterById, QrPairingCodeCodec } from "@matter/main/types";
 import { Endpoint, NodeStates } from "@project-chip/matter.js/device";
 import { WebSocketServer } from "ws";
 import { ControllerCommandHandler } from "../controller/ControllerCommandHandler.js";
-import { CommissioningRequest } from "../types/CommandHandler.js";
 import { VendorIds } from "../data/VendorIDs.js";
 import { ClusterMap, ClusterMapEntry } from "../model/ModelMapper.js";
+import { CommissioningRequest } from "../types/CommandHandler.js";
 import { HttpServer, WebServerHandler } from "../types/WebServer.js";
 import {
     ArgsOf,
@@ -29,6 +20,7 @@ import {
     ResponseOf,
     ServerInfoMessage,
     SuccessResultMessage,
+    TEST_NODE_START,
 } from "../types/WebSocketMessageTypes.js";
 import { MATTER_VERSION } from "../util/matterVersion.js";
 import { ConfigStorage } from "./ConfigStorage.js";
@@ -36,6 +28,7 @@ import {
     buildAttributePath,
     convertMatterToWebSocketTagBased,
     getDateAsString,
+    parsePythonJson,
     splitAttributePath,
     toPythonJson,
 } from "./Converters.js";
@@ -47,10 +40,27 @@ export class WebSocketControllerHandler implements WebServerHandler {
     #config: ConfigStorage;
     #wss?: WebSocketServer;
     #closed = false;
+    #testNodes = new Map<bigint, MatterNode>();
 
     constructor(commandHandler: ControllerCommandHandler, config: ConfigStorage) {
         this.#commandHandler = commandHandler;
         this.#config = config;
+    }
+
+    /**
+     * Check if a node ID is a test node (>= TEST_NODE_START).
+     */
+    #isTestNode(nodeId: number | bigint): boolean {
+        const bigId = typeof nodeId === "bigint" ? nodeId : BigInt(nodeId);
+        return bigId >= TEST_NODE_START;
+    }
+
+    /**
+     * Get a test node by ID.
+     */
+    #getTestNode(nodeId: number | bigint): MatterNode | undefined {
+        const bigId = typeof nodeId === "bigint" ? nodeId : BigInt(nodeId);
+        return this.#testNodes.get(bigId);
     }
 
     async register(server: HttpServer) {
@@ -153,7 +163,9 @@ export class WebSocketControllerHandler implements WebServerHandler {
             observers.on(this.#commandHandler.events.nodeEndpointRemoved, (nodeId, endpointId) => {
                 if (this.#closed || !listening) return;
                 logger.info(`Sending endpoint_removed event for Node ${nodeId} endpoint ${endpointId}`);
-                ws.send(toPythonJson({ event: "endpoint_removed", data: { node_id: nodeId, endpoint_id: endpointId } }));
+                ws.send(
+                    toPythonJson({ event: "endpoint_removed", data: { node_id: nodeId, endpoint_id: endpointId } }),
+                );
             });
 
             const onClose = () => observers.close();
@@ -214,7 +226,8 @@ export class WebSocketControllerHandler implements WebServerHandler {
         let messageId: string | undefined;
         try {
             logger.info("Received WebSocket request", data);
-            const request = JSON.parse(data);
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const request = parsePythonJson(data) as { message_id: string; command: string; args: any };
             const { command, args } = request;
             messageId = request.message_id;
             let result: ResponseOf<any>;
@@ -462,14 +475,29 @@ export class WebSocketControllerHandler implements WebServerHandler {
 
     async #handleGetNodes(_args: ArgsOf<"get_nodes">): Promise<ResponseOf<"get_nodes">> {
         const nodeDetails = new Array<MatterNode>();
+        // Include real nodes
         for (const node of this.#commandHandler.getNodeIds()) {
             nodeDetails.push(await this.#collectNodeDetails(node));
+        }
+        // Include test nodes
+        for (const testNode of this.#testNodes.values()) {
+            nodeDetails.push(testNode);
         }
         return nodeDetails;
     }
 
     async #handleGetNode(args: ArgsOf<"get_node">): Promise<ResponseOf<"get_node">> {
         const { node_id } = args;
+
+        // Handle test nodes
+        if (this.#isTestNode(node_id)) {
+            const testNode = this.#getTestNode(node_id);
+            if (testNode === undefined) {
+                throw new Error(`Test node ${node_id} not found`);
+            }
+            return testNode;
+        }
+
         const nodeId = NodeId(node_id);
         const node = this.#commandHandler.getNode(nodeId);
         if (node === undefined) {
@@ -482,6 +510,13 @@ export class WebSocketControllerHandler implements WebServerHandler {
         args: ArgsOf<"get_node_ip_addresses">,
     ): Promise<ResponseOf<"get_node_ip_addresses">> {
         const { node_id, prefer_cache, scoped } = args;
+
+        // Handle test nodes - return mock IPs
+        if (this.#isTestNode(node_id)) {
+            logger.debug(`get_node_ip_addresses called for test node ${node_id}`);
+            return ["0.0.0.0", "0000:1111:2222:3333:4444"];
+        }
+
         const result = await this.#commandHandler.getNodeIpAddresses(NodeId(node_id), prefer_cache);
         if (!scoped) {
             return result;
@@ -491,6 +526,18 @@ export class WebSocketControllerHandler implements WebServerHandler {
 
     async #handleReadAttribute(args: ArgsOf<"read_attribute">): Promise<ResponseOf<"read_attribute">> {
         const { node_id: nodeId, attribute_path } = args;
+
+        // Handle test nodes - return value from stored attributes
+        if (this.#isTestNode(nodeId)) {
+            const testNode = this.#getTestNode(nodeId);
+            if (testNode === undefined) {
+                throw new Error(`Test node ${nodeId} not found`);
+            }
+            logger.debug(`read_attribute called for test node ${nodeId} on path: ${attribute_path}`);
+            const value = testNode.attributes[attribute_path];
+            return { [attribute_path]: value };
+        }
+
         const { endpointId, clusterId, attributeId } = splitAttributePath(attribute_path);
         const { values, status } = await this.#commandHandler.handleReadAttribute({
             nodeId: NodeId(nodeId),
@@ -515,6 +562,24 @@ export class WebSocketControllerHandler implements WebServerHandler {
     async #handleWriteAttribute(args: ArgsOf<"write_attribute">): Promise<ResponseOf<"write_attribute">> {
         const { node_id: nodeId, attribute_path, value } = args;
         const { endpointId, clusterId, attributeId } = splitAttributePath(attribute_path);
+
+        // Handle test nodes - log and return success (no real write)
+        if (this.#isTestNode(nodeId)) {
+            logger.debug(
+                `write_attribute called for test node ${nodeId} on path ${attribute_path} - value: ${JSON.stringify(value)}`,
+            );
+            return [
+                {
+                    Path: {
+                        EndpointId: endpointId,
+                        ClusterId: clusterId,
+                        AttributeId: attributeId,
+                    },
+                    Status: 0,
+                },
+            ];
+        }
+
         const { status } = await this.#commandHandler.handleWriteAttribute({
             nodeId: NodeId(nodeId),
             endpointId,
@@ -560,6 +625,16 @@ export class WebSocketControllerHandler implements WebServerHandler {
             timed_request_timeout_ms: timedInteractionTimeoutMs,
             // interaction_timeout_ms, // TODO
         } = args;
+
+        // Handle test nodes - log and return null (no real command)
+        if (this.#isTestNode(nodeId)) {
+            logger.debug(
+                `device_command called for test node ${nodeId} on endpoint_id: ${endpointId} - ` +
+                    `cluster_id: ${clusterId} - command_name: ${commandName} - payload: ${JSON.stringify(payload)}`,
+            );
+            return null;
+        }
+
         const result = await this.#commandHandler.handleInvoke({
             nodeId: NodeId(nodeId),
             endpointId: EndpointNumber(endpointId),
@@ -577,6 +652,19 @@ export class WebSocketControllerHandler implements WebServerHandler {
 
     async #handleInterviewNode(args: ArgsOf<"interview_node">): Promise<ResponseOf<"interview_node">> {
         const { node_id } = args;
+
+        // Handle test nodes - just broadcast node_updated event
+        if (this.#isTestNode(node_id)) {
+            const testNode = this.#getTestNode(node_id);
+            if (testNode === undefined) {
+                throw new Error(`Test node ${node_id} not found`);
+            }
+            logger.debug(`interview_node called for test node ${node_id}`);
+            // Broadcast node_updated event for test node
+            this.#broadcastEvent("node_updated", testNode);
+            return null;
+        }
+
         const nodeId = NodeId(node_id);
         const node = this.#commandHandler.getNode(nodeId);
         if (node === undefined) {
@@ -596,11 +684,32 @@ export class WebSocketControllerHandler implements WebServerHandler {
 
     async #handlePingNode(args: ArgsOf<"ping_node">): Promise<ResponseOf<"ping_node">> {
         const { node_id } = args;
+
+        // Handle test nodes - return mock result
+        if (this.#isTestNode(node_id)) {
+            logger.debug(`ping_node called for test node ${node_id}`);
+            return { "0.0.0.0": true, "0000:1111:2222:3333:4444": true };
+        }
+
         return await this.#commandHandler.pingNode(NodeId(node_id));
     }
 
     async #handleRemoveNode(args: ArgsOf<"remove_node">): Promise<ResponseOf<"remove_node">> {
         const { node_id } = args;
+
+        // Handle test nodes - just remove from memory and emit event
+        if (this.#isTestNode(node_id)) {
+            const bigId = typeof node_id === "bigint" ? node_id : BigInt(node_id);
+            if (!this.#testNodes.has(bigId)) {
+                throw new Error(`Test node ${node_id} does not exist`);
+            }
+            logger.info(`Removing test node ${node_id}`);
+            this.#testNodes.delete(bigId);
+            // Broadcast node_removed event
+            this.#broadcastEvent("node_removed", node_id);
+            return null;
+        }
+
         await this.#commandHandler.decommissionNode(NodeId(node_id));
         return null;
     }
@@ -710,8 +819,65 @@ export class WebSocketControllerHandler implements WebServerHandler {
         return await this.#commandHandler.setNodeBinding(NodeId(node_id), EndpointNumber(endpoint), bindings);
     }
 
-    async #handleImportTestNode(_args: ArgsOf<"import_test_node">): Promise<ResponseOf<"import_test_node">> {
-        throw new Error("Not implemented");
+    async #handleImportTestNode(args: ArgsOf<"import_test_node">): Promise<ResponseOf<"import_test_node">> {
+        const { dump } = args;
+
+        // Parse the JSON dump (handles large node IDs as BigInt)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const dumpData = parsePythonJson(dump) as any;
+
+        // Extract nodes from dump - can be single node or multiple nodes
+        // Format from Home Assistant diagnostics:
+        // - Single node: dump_data.data.node
+        // - Multiple nodes (server dump): dump_data.data.server.nodes
+        let dumpNodes: Array<MatterNode>;
+
+        if (dumpData?.data?.node) {
+            dumpNodes = [dumpData.data.node];
+        } else if (dumpData?.data?.server?.nodes) {
+            dumpNodes = Object.values(dumpData.data.server.nodes);
+        } else if (dumpData?.data?.nodes) {
+            // Alternative format: direct nodes array
+            dumpNodes = Object.values(dumpData.data.nodes);
+        } else {
+            throw new Error("Invalid dump format: cannot find node data");
+        }
+
+        // Find the next available test node ID (bigint)
+        let nextTestNodeId: bigint = TEST_NODE_START;
+        for (const existingId of this.#testNodes.keys()) {
+            if (existingId >= nextTestNodeId) {
+                nextTestNodeId = existingId + 1n;
+            }
+        }
+
+        // Process each node from the dump
+        for (const nodeDict of dumpNodes) {
+            const testNodeId: bigint = nextTestNodeId++;
+
+            // Create MatterNode with test node ID, keeping original attributes as-is
+            const testNode: MatterNode = {
+                node_id: testNodeId,
+                date_commissioned: nodeDict.date_commissioned,
+                last_interview: nodeDict.last_interview,
+                interview_version: nodeDict.interview_version,
+                available: nodeDict.available,
+                is_bridge: nodeDict.is_bridge,
+                attributes: nodeDict.attributes,
+                attribute_subscriptions: [],
+            };
+
+            // Store the test node
+            this.#testNodes.set(testNodeId, testNode);
+
+            // Log the imported node
+            logger.info(`Imported test node ${testNodeId} with ${Object.keys(testNode.attributes).length} attributes`);
+
+            // Emit node_added event via broadcast (test nodes don't go through command handler)
+            this.#broadcastEvent("node_added", testNode);
+        }
+
+        return null;
     }
 
     async #handleCheckNodeUpdate(args: ArgsOf<"check_node_update">): Promise<ResponseOf<"check_node_update">> {

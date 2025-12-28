@@ -198,8 +198,7 @@ export function convertMatterToWebSocketTagBased(
     return value;
 }
 
-/** JSON stringify with BigInt handling if number, if bigger than max int  */
-// TODO: needed?
+/** JSON stringify with BigInt handling - converts BigInt to numbers, large values stay as raw numbers */
 export function toPythonJson(object: object, spaces?: number): string {
     const replacements = new Array<{ from: string; to: string }>();
     let result = JSON.stringify(
@@ -207,7 +206,8 @@ export function toPythonJson(object: object, spaces?: number): string {
         (_key, value) => {
             if (typeof value === "bigint") {
                 if (value > Number.MAX_SAFE_INTEGER) {
-                    replacements.push({ from: `":"0x${value.toString(16)}"`, to: `":${value.toString()}` });
+                    // Store replacement: quoted hex string -> raw decimal number
+                    replacements.push({ from: `"0x${value.toString(16)}"`, to: value.toString() });
                     return `0x${value.toString(16)}`;
                 } else {
                     return Number(value);
@@ -217,7 +217,8 @@ export function toPythonJson(object: object, spaces?: number): string {
         },
         spaces,
     );
-    // Chip JSON is no JS JSON, so we need to replace the hex strings with the correct full number again
+    // Python JSON has raw large numbers (not strings), so we need to replace the hex strings with the full decimal
+    // This handles both object values and array elements
     if (replacements.length > 0) {
         replacements.forEach(({ from, to }) => {
             result = result.replaceAll(from, to);
@@ -227,8 +228,35 @@ export function toPythonJson(object: object, spaces?: number): string {
     return result;
 }
 
+/** Marker prefix for large numbers that need BigInt conversion */
+const BIGINT_MARKER = "__BIGINT__";
+
+/**
+ * JSON parse with BigInt handling for large numbers that exceed JavaScript precision.
+ * Numbers with 15+ digits that exceed MAX_SAFE_INTEGER are converted to BigInt.
+ */
+export function parsePythonJson(json: string): unknown {
+    // Pre-process: Replace large numbers (15+ digits) with marked string placeholders
+    // This must happen before JSON.parse to preserve precision
+    // Match numbers after colon (object values) or after [ or , (array elements)
+    const processed = json.replace(/([:,\[])\s*(\d{15,})(?=[,}\]\s])/g, (match, prefix, number) => {
+        const num = BigInt(number);
+        if (num > Number.MAX_SAFE_INTEGER) {
+            return `${prefix}"${BIGINT_MARKER}${number}"`;
+        }
+        return match;
+    });
+
+    // Parse with reviver to convert marked strings back to BigInt
+    return JSON.parse(processed, (_key, value) => {
+        if (typeof value === "string" && value.startsWith(BIGINT_MARKER)) {
+            return BigInt(value.slice(BIGINT_MARKER.length));
+        }
+        return value;
+    });
+}
+
 /** Chip JSON-like data strings can contain long numbers that are not supported by JSON.parse */
-// TODO Needed?
 function parseChipJSON(json: string) {
     json = json.replace(/: (\d{15,})[,}]/g, (match, number) => {
         const num = BigInt(number);

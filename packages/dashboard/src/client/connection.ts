@@ -1,3 +1,4 @@
+import { parsePythonJson, toPythonJson } from "./json-utils.js";
 import { CommandMessage, ServerInfoMessage } from "./models/model.js";
 
 export class Connection {
@@ -39,10 +40,10 @@ export class Connection {
             };
 
             this.socket.onmessage = (event: MessageEvent) => {
-                const data = JSON.parse(event.data);
+                const data = parsePythonJson(event.data) as Record<string, any>;
                 console.log("WebSocket OnMessage", data);
                 if (!this.serverInfo) {
-                    this.serverInfo = data;
+                    this.serverInfo = data as ServerInfoMessage;
                     resolve(undefined);
                     return;
                 }
@@ -63,7 +64,7 @@ export class Connection {
             throw new Error("Not connected");
         }
         console.log("WebSocket send message", message);
-        this.socket.send(JSON.stringify(message));
+        this.socket.send(toPythonJson(message));
     }
 }
 

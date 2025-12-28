@@ -159,7 +159,9 @@ export interface APICommands {
         response: { [key: string]: boolean };
     };
     import_test_node: {
-        requestArgs: {};
+        requestArgs: {
+            dump: string;
+        };
         response: null;
     };
     get_node_ip_addresses: {
@@ -406,3 +408,9 @@ export interface SuccessResultMessage<T extends keyof APICommands> extends Resul
 
 export type ArgsOf<R extends keyof APICommands> = APICommands[R]["requestArgs"];
 export type ResponseOf<R extends keyof APICommands> = APICommands[R]["response"];
+
+/**
+ * Minimum test node ID. Node IDs >= this value are reserved for test nodes.
+ * Uses high 64-bit range (0xFFFF_FFFE_0000_0000) to avoid collision with real node IDs.
+ */
+export const TEST_NODE_START = 0xffff_fffe_0000_0000n;

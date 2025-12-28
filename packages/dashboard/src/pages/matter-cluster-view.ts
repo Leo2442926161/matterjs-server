@@ -6,6 +6,7 @@ import "@material/web/list/list-item";
 import { LitElement, css, html } from "lit";
 import { customElement, property } from "lit/decorators.js";
 import { MatterClient } from "../client/client.js";
+import { toPythonJson } from "../client/json-utils.js";
 import { clusters } from "../client/models/descriptions.js";
 import { MatterNode } from "../client/models/node.js";
 import { showAlertDialog } from "../components/dialog-box/show-dialog-box.js";
@@ -87,7 +88,7 @@ class MatterClusterView extends LitElement {
                                     ${clusters[this.cluster!]?.attributes[attribute.key]?.type || "unknown"}
                                 </div>
                                 <div slot="end">
-                                    ${JSON.stringify(attribute.value).length > 20
+                                    ${toPythonJson(attribute.value).length > 20
                                         ? html`<button
                                               @click=${() => {
                                                   this._showAttributeValue(attribute.value);
@@ -95,7 +96,7 @@ class MatterClusterView extends LitElement {
                                           >
                                               Show value
                                           </button>`
-                                        : JSON.stringify(attribute.value)}
+                                        : toPythonJson(attribute.value)}
                                 </div>
                             </md-list-item>
                             <md-divider />
@@ -109,7 +110,7 @@ class MatterClusterView extends LitElement {
     private async _showAttributeValue(value: any) {
         showAlertDialog({
             title: "Attribute value",
-            text: JSON.stringify(value),
+            text: toPythonJson(value),
         });
     }
 
