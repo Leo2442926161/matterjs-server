@@ -7,8 +7,8 @@ This document compares the WebSocket API functionality between the original Pyth
 | Category | Python Server | Matter.js Server | Coverage |
 |----------|--------------|------------------|----------|
 | Commands | 26 | 25 implemented | ~96% |
-| Events | 9 | 6 | ~67% |
-| Full functionality | - | - | ~85% |
+| Events | 9 | 9 | 100% |
+| Full functionality | - | - | ~98% |
 
 ---
 
@@ -102,10 +102,10 @@ This document compares the WebSocket API functionality between the original Pyth
 | `node_removed` | ✅ | ✅ | Node decommissioned |
 | `node_event` | ✅ | ✅ | Cluster events (e.g., button press) |
 | `attribute_updated` | ✅ | ✅ | Attribute value changed |
-| `server_shutdown` | ✅ | ❌ | Server shutting down notification |
-| `server_info_updated` | ✅ | ❌ | Server info changed |
-| `endpoint_added` | ✅ | ❌ | Bridge endpoint added |
-| `endpoint_removed` | ✅ | ❌ | Bridge endpoint removed |
+| `server_shutdown` | ✅ | ✅ | Server shutting down notification |
+| `server_info_updated` | ✅ | ✅ | Server info changed (WiFi/Thread credentials) |
+| `endpoint_added` | ✅ | ✅ | Bridge endpoint added |
+| `endpoint_removed` | ✅ | ✅ | Bridge endpoint removed |
 
 ---
 
@@ -203,58 +203,40 @@ The implementation forwards Matter events to WebSocket clients with the followin
 
 ---
 
-### 5. `server_shutdown` Event (Priority: Low)
+### ~~5. `server_shutdown` Event~~ ✅ IMPLEMENTED
 
-**Purpose:** Notify clients that the server is shutting down gracefully.
+This event has been implemented. See `WebSocketControllerHandler.unregister()`.
 
-**Use Cases:**
-- Client can reconnect to backup server
-- Client can notify user of disconnection reason
-- Clean disconnection handling
-
-**Implementation Notes:**
-- Send before closing WebSocket connections
-- Include shutdown reason if available
+Sends `server_shutdown` event to all connected clients before closing connections.
 
 ---
 
-### 7. `server_info_updated` Event (Priority: Low)
+### ~~6. `server_info_updated` Event~~ ✅ IMPLEMENTED
 
-**Purpose:** Notify clients when server configuration changes.
+This event has been implemented. See `WebSocketControllerHandler.#broadcastServerInfoUpdated()`.
 
-**Triggers:**
-- WiFi credentials set/cleared
-- Thread dataset set/cleared
-- Bluetooth enabled/disabled
-
-**Use Cases:**
-- UI updates to reflect server capabilities
-- Commissioning flow adjustments
+Triggers when:
+- WiFi credentials are set via `set_wifi_credentials`
+- Thread dataset is set via `set_thread_dataset`
 
 ---
 
-### 8. `endpoint_added` / `endpoint_removed` Events (Priority: Medium)
+### ~~7. `endpoint_added` / `endpoint_removed` Events~~ ✅ IMPLEMENTED
 
-**Purpose:** Notify clients when bridge devices add/remove child endpoints dynamically.
+These events have been implemented. See:
+- `ControllerCommandHandler.events.nodeEndpointAdded`
+- `ControllerCommandHandler.events.nodeEndpointRemoved`
 
-**Data Format:**
-```python
-(node_id: int, endpoint_id: int)
+Wired to PairedNode's `nodeEndpointAdded` and `nodeEndpointRemoved` events.
+
+Data Format:
+```typescript
+{ node_id: number | bigint, endpoint_id: number }
 ```
 
-**Use Cases:**
-- Bridge device adds new child device
-- Bridge device removes child device
-- Dynamic device discovery on bridges
-
-**Implementation Notes:**
-- Monitor Descriptor cluster's PartsList attribute
-- Compare before/after to detect changes
-- Important for Hue Bridge, IKEA Gateway, etc.
-
 ---
 
-### 9. OTA Update Support (Priority: Low)
+### 8. OTA Update Support (Priority: Low)
 
 **`check_node_update`:**
 - Query Matter CSA Distributed Compliance Ledger (DCL) for updates
@@ -322,14 +304,13 @@ Both implementations use compatible structures with attribute paths in `endpoint
 All high-priority items have been implemented! ✅
 
 ### Medium Priority (Important features)
-1. `endpoint_added`/`endpoint_removed` events - Bridge support
+All medium-priority items have been implemented! ✅
+- `endpoint_added`/`endpoint_removed` events - Bridge support ✅
 
 ### Low Priority (Nice to have)
-2. `ping_node` - Full implementation
-3. `server_shutdown` event
-4. `server_info_updated` event
-5. OTA update support
-6. `import_test_node` - Testing support
+1. `ping_node` - Full implementation (currently stubbed)
+2. OTA update support (`check_node_update`, `update_node`)
+3. `import_test_node` - Testing support
 
 ---
 

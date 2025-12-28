@@ -143,6 +143,16 @@ export class WebSocketControllerHandler implements WebServerHandler {
             };
             const onNodeStructureChanged = (nodeId: NodeId) => sendNodeDetailsEvent("node_updated", nodeId);
             const onNodeDecommissioned = (nodeId: NodeId) => sendNodeDetailsEvent("node_removed", nodeId);
+            const onNodeEndpointAdded = (nodeId: NodeId, endpointId: EndpointNumber) => {
+                if (this.#closed || !listening) return;
+                logger.info(`Sending endpoint_added event for Node ${nodeId} endpoint ${endpointId}`);
+                ws.send(toPythonJson({ event: "endpoint_added", data: { node_id: nodeId, endpoint_id: endpointId } }));
+            };
+            const onNodeEndpointRemoved = (nodeId: NodeId, endpointId: EndpointNumber) => {
+                if (this.#closed || !listening) return;
+                logger.info(`Sending endpoint_removed event for Node ${nodeId} endpoint ${endpointId}`);
+                ws.send(toPythonJson({ event: "endpoint_removed", data: { node_id: nodeId, endpoint_id: endpointId } }));
+            };
 
             const onClose = () => {
                 this.#commandHandler.events.attributeChanged.off(onAttributeChanged);
@@ -151,6 +161,8 @@ export class WebSocketControllerHandler implements WebServerHandler {
                 this.#commandHandler.events.nodeStateChanged.off(onNodeStateChanged);
                 this.#commandHandler.events.nodeStructureChanged.off(onNodeStructureChanged);
                 this.#commandHandler.events.nodeDecommissioned.off(onNodeDecommissioned);
+                this.#commandHandler.events.nodeEndpointAdded.off(onNodeEndpointAdded);
+                this.#commandHandler.events.nodeEndpointRemoved.off(onNodeEndpointRemoved);
             };
 
             ws.on(
@@ -182,6 +194,8 @@ export class WebSocketControllerHandler implements WebServerHandler {
             this.#commandHandler.events.nodeStateChanged.on(onNodeStateChanged);
             this.#commandHandler.events.nodeStructureChanged.on(onNodeStructureChanged);
             this.#commandHandler.events.nodeDecommissioned.on(onNodeDecommissioned);
+            this.#commandHandler.events.nodeEndpointAdded.on(onNodeEndpointAdded);
+            this.#commandHandler.events.nodeEndpointRemoved.on(onNodeEndpointRemoved);
 
             this.#getServerInfo().then(
                 response => ws.send(toPythonJson(response)),
@@ -193,6 +207,19 @@ export class WebSocketControllerHandler implements WebServerHandler {
     }
 
     async unregister() {
+        // Send server_shutdown event to all connected clients before closing
+        if (this.#wss) {
+            const shutdownMessage = toPythonJson({ event: "server_shutdown", data: {} });
+            this.#wss.clients.forEach(client => {
+                if (client.readyState === 1 /* WebSocket.OPEN */) {
+                    try {
+                        client.send(shutdownMessage);
+                    } catch (err) {
+                        logger.warn("Failed to send server_shutdown event to client", err);
+                    }
+                }
+            });
+        }
         this.#closed = true;
         this.#wss?.close();
     }
@@ -325,10 +352,36 @@ export class WebSocketControllerHandler implements WebServerHandler {
             schema_version: 11,
             min_supported_schema_version: 11,
             sdk_version: `matter.js/${MATTER_VERSION}`,
-            wifi_credentials_set: false,
-            thread_credentials_set: false,
+            wifi_credentials_set: !!(this.#config.wifiSsid && this.#config.wifiCredentials),
+            thread_credentials_set: !!this.#config.threadDataset,
             bluetooth_enabled: this.#commandHandler.bleEnabled,
         };
+    }
+
+    /**
+     * Broadcast an event to all connected WebSocket clients.
+     */
+    #broadcastEvent(event: string, data: unknown) {
+        if (!this.#wss || this.#closed) return;
+        const message = toPythonJson({ event, data });
+        this.#wss.clients.forEach(client => {
+            if (client.readyState === 1 /* WebSocket.OPEN */) {
+                try {
+                    client.send(message);
+                } catch (err) {
+                    logger.warn(`Failed to broadcast ${event} event to client`, err);
+                }
+            }
+        });
+    }
+
+    /**
+     * Send server_info_updated event to all connected clients.
+     */
+    async #broadcastServerInfoUpdated() {
+        const serverInfo = await this.#getServerInfo();
+        logger.info("Broadcasting server_info_updated event", serverInfo);
+        this.#broadcastEvent("server_info_updated", serverInfo);
     }
 
     async #handleStartListening(_args: ArgsOf<"start_listening">): Promise<ResponseOf<"start_listening">> {
@@ -579,12 +632,16 @@ export class WebSocketControllerHandler implements WebServerHandler {
     async #handleSetWifiCredentials(args: ArgsOf<"set_wifi_credentials">): Promise<ResponseOf<"set_wifi_credentials">> {
         const { ssid, credentials } = args;
         await this.#config.set({ wifiSsid: ssid, wifiCredentials: credentials });
+        // Broadcast server_info_updated event to notify clients of credential change
+        void this.#broadcastServerInfoUpdated();
         return {};
     }
 
     async #handleSetThreadDataset(args: ArgsOf<"set_thread_dataset">): Promise<ResponseOf<"set_thread_dataset">> {
         const { dataset } = args;
         await this.#config.set({ threadDataset: dataset });
+        // Broadcast server_info_updated event to notify clients of credential change
+        void this.#broadcastServerInfoUpdated();
         return {};
     }
 

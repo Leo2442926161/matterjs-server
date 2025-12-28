@@ -97,6 +97,8 @@ export class ControllerCommandHandler {
         nodeStateChanged: new Observable<[nodeId: NodeId, state: NodeStates]>(),
         nodeStructureChanged: new Observable<[nodeId: NodeId]>(),
         nodeDecommissioned: new Observable<[nodeId: NodeId]>(),
+        nodeEndpointAdded: new Observable<[nodeId: NodeId, endpointId: EndpointNumber]>(),
+        nodeEndpointRemoved: new Observable<[nodeId: NodeId, endpointId: EndpointNumber]>(),
     };
 
     constructor(controllerInstance: CommissioningController, bleEnabled: boolean) {
@@ -142,6 +144,8 @@ export class ControllerCommandHandler {
         node.events.stateChanged.on(state => this.events.nodeStateChanged.emit(node.nodeId, state));
         node.events.structureChanged.on(() => this.events.nodeStructureChanged.emit(node.nodeId));
         node.events.decommissioned.on(() => this.events.nodeDecommissioned.emit(node.nodeId));
+        node.events.nodeEndpointAdded.on(endpointId => this.events.nodeEndpointAdded.emit(node.nodeId, endpointId));
+        node.events.nodeEndpointRemoved.on(endpointId => this.events.nodeEndpointRemoved.emit(node.nodeId, endpointId));
 
         // Store the node for direct access
         this.#nodes.set(nodeId, node);

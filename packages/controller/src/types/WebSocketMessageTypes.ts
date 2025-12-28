@@ -299,13 +299,13 @@ interface APIEvents {
         data: [node_id: number | bigint, attribute_path: string, value: unknown];
     };
     server_shutdown: {
-        data: {};
+        data: Record<string, never>;
     };
     endpoint_added: {
-        data: {};
+        data: { node_id: number | bigint; endpoint_id: number };
     };
     endpoint_removed: {
-        data: {};
+        data: { node_id: number | bigint; endpoint_id: number };
     };
     server_info_updated: {
         data: ServerInfoMessage;
