@@ -25,9 +25,23 @@ import {
 import {
     DecodedAttributeReportValue,
     DecodedEventReportValue,
+    PeerAddress,
     SignatureFromCommandSpec,
     SupportedTransportsSchema,
 } from "@matter/main/protocol";
+
+/**
+ * Software update info from the OTA provider.
+ * Matches the SoftwareUpdateInfo interface from @matter/node.
+ */
+interface SoftwareUpdateInfo {
+    vendorId: VendorId;
+    productId: number;
+    softwareVersion: number;
+    softwareVersionString: string;
+    releaseNotesUrl?: string;
+    specificationVersion?: number;
+}
 import {
     Attribute,
     ClusterId,
@@ -80,6 +94,8 @@ import {
     AccessControlTarget,
     AttributeWriteResult,
     BindingTarget,
+    MatterSoftwareVersion,
+    UpdateSource,
 } from "../types/WebSocketMessageTypes.js";
 
 const logger = Logger.get("ControllerCommandHandler");
@@ -90,6 +106,8 @@ export class ControllerCommandHandler {
     #connected = false;
     #bleEnabled = false;
     #nodes = new Map<NodeId, PairedNode>();
+    /** Cache of available updates keyed by nodeId */
+    #availableUpdates = new Map<NodeId, SoftwareUpdateInfo>();
     events = {
         attributeChanged: new Observable<[nodeId: NodeId, data: DecodedAttributeReportValue<any>]>(),
         eventChanged: new Observable<[nodeId: NodeId, data: DecodedEventReportValue<any>]>(),
@@ -122,11 +140,55 @@ export class ControllerCommandHandler {
         try {
             await this.#controller.start();
             logger.info(`Controller started`);
+
+            // Subscribe to OTA provider events to track available updates
+            this.#setupOtaEventHandlers();
         } catch (error) {
             const errorText = inspect(error, { depth: 10 });
             // Catch and log error, else the test framework hides issues here
             logger.error(errorText);
             throw error;
+        }
+    }
+
+    /**
+     * Set up event handlers for OTA update notifications from the SoftwareUpdateManager.
+     */
+    #setupOtaEventHandlers() {
+        try {
+            const otaProvider = this.#controller.otaProvider;
+            if (!otaProvider) {
+                logger.info("OTA provider not available");
+                return;
+            }
+
+            // Access the SoftwareUpdateManager behavior events dynamically
+            // Using 'any' because SoftwareUpdateManager is not directly exported from @matter/node
+            void otaProvider.act((agent: any) => {
+                const softwareUpdateManager = agent.get("softwareupdates");
+                if (!softwareUpdateManager?.events) {
+                    logger.info("SoftwareUpdateManager not available");
+                    return;
+                }
+
+                // Handle updateAvailable events - cache the update info
+                softwareUpdateManager.events.updateAvailable.on(
+                    (peerAddress: PeerAddress, updateDetails: SoftwareUpdateInfo) => {
+                        logger.info(`Update available for node ${peerAddress.nodeId}:`, updateDetails);
+                        this.#availableUpdates.set(peerAddress.nodeId, updateDetails);
+                    },
+                );
+
+                // Handle updateDone events - clear the cached update info
+                softwareUpdateManager.events.updateDone.on((peerAddress: PeerAddress) => {
+                    logger.info(`Update done for node ${peerAddress.nodeId}`);
+                    this.#availableUpdates.delete(peerAddress.nodeId);
+                });
+            });
+
+            logger.info("OTA event handlers registered");
+        } catch (error) {
+            logger.warn("Failed to setup OTA event handlers:", error);
         }
     }
 
@@ -876,5 +938,142 @@ export class ControllerCommandHandler {
                 },
             ];
         }
+    }
+
+    /**
+     * Check if a software update is available for a node.
+     * First checks the cached updates from OTA events, then queries the DCL if not found.
+     */
+    async checkNodeUpdate(nodeId: NodeId): Promise<MatterSoftwareVersion | null> {
+        // First check if we have a cached update from the updateAvailable event
+        const cachedUpdate = this.#availableUpdates.get(nodeId);
+        if (cachedUpdate) {
+            return this.#convertToMatterSoftwareVersion(cachedUpdate, UpdateSource.MAIN_NET_DCL);
+        }
+
+        // No cached update, query the OTA provider
+        const node = this.getNode(nodeId);
+        if (node === undefined) {
+            throw new Error("Node not found");
+        }
+
+        try {
+            const otaProvider = this.#controller.otaProvider;
+            if (!otaProvider) {
+                logger.info("OTA provider not available");
+                return null;
+            }
+
+            // Get fabric index for the peer address
+            const fabricIndex = await this.#getNodeFabricIndex(node);
+            const peerAddress = PeerAddress({ nodeId, fabricIndex });
+
+            // Query OTA provider for updates using dynamic behavior access
+            const updatesAvailable = await otaProvider.act((agent: any) =>
+                agent.get("softwareupdates").queryUpdates({
+                    peerToCheck: node.node,
+                    includeStoredUpdates: true,
+                }),
+            );
+
+            // Find update for this specific node
+            const nodeUpdate = updatesAvailable.find(
+                (update: { peerAddress: PeerAddress; info: any }) =>
+                    PeerAddress.is(update.peerAddress, peerAddress),
+            );
+
+            if (nodeUpdate) {
+                const { info } = nodeUpdate;
+                // Cache the update for future use
+                const updateInfo: SoftwareUpdateInfo = {
+                    vendorId: info.vendorId,
+                    productId: info.productId,
+                    softwareVersion: info.softwareVersion,
+                    softwareVersionString: info.softwareVersionString,
+                };
+                this.#availableUpdates.set(nodeId, updateInfo);
+
+                return this.#convertToMatterSoftwareVersion(updateInfo, UpdateSource.MAIN_NET_DCL);
+            }
+
+            return null;
+        } catch (error) {
+            logger.warn(`Failed to check for updates for node ${nodeId}:`, error);
+            return null;
+        }
+    }
+
+    /**
+     * Trigger a software update for a node.
+     * @param nodeId The node to update
+     * @param softwareVersion The target software version to update to
+     */
+    async updateNode(nodeId: NodeId, softwareVersion: number): Promise<MatterSoftwareVersion | null> {
+        const node = this.getNode(nodeId);
+        if (node === undefined) {
+            throw new Error("Node not found");
+        }
+
+        try {
+            const otaProvider = this.#controller.otaProvider;
+            if (!otaProvider) {
+                throw new Error("OTA provider not available");
+            }
+
+            // Get the cached update info or query for it
+            let updateInfo = this.#availableUpdates.get(nodeId);
+            if (!updateInfo) {
+                // Try to get update info by querying
+                const result = await this.checkNodeUpdate(nodeId);
+                if (!result) {
+                    throw new Error("No update available for this node");
+                }
+                updateInfo = this.#availableUpdates.get(nodeId);
+                if (!updateInfo) {
+                    throw new Error("Failed to get update info");
+                }
+            }
+
+            // Get fabric index and basic info for the update
+            const fabricIndex = await this.#getNodeFabricIndex(node);
+            const peerAddress = PeerAddress({ nodeId, fabricIndex });
+
+            logger.info(`Starting update for node ${nodeId} to version ${softwareVersion}`);
+
+            // Trigger the update using forceUpdate via dynamic behavior access
+            await otaProvider.act((agent: any) =>
+                agent.get("softwareupdates").forceUpdate(
+                    peerAddress,
+                    updateInfo.vendorId,
+                    updateInfo.productId,
+                    softwareVersion,
+                ),
+            );
+
+            // Return the update info
+            return this.#convertToMatterSoftwareVersion(updateInfo, UpdateSource.MAIN_NET_DCL);
+        } catch (error) {
+            logger.error(`Failed to update node ${nodeId}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Convert SoftwareUpdateInfo to MatterSoftwareVersion format for WebSocket API.
+     */
+    #convertToMatterSoftwareVersion(
+        updateInfo: SoftwareUpdateInfo,
+        updateSource: UpdateSource,
+    ): MatterSoftwareVersion {
+        return {
+            vid: updateInfo.vendorId,
+            pid: updateInfo.productId,
+            software_version: updateInfo.softwareVersion,
+            software_version_string: updateInfo.softwareVersionString,
+            min_applicable_software_version: 0, // Not available from SoftwareUpdateInfo
+            max_applicable_software_version: updateInfo.softwareVersion - 1,
+            release_notes_url: updateInfo.releaseNotesUrl,
+            update_source: updateSource,
+        };
     }
 }

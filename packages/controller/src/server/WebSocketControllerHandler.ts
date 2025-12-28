@@ -311,10 +311,10 @@ export class WebSocketControllerHandler implements WebServerHandler {
                     result = await this.#handleImportTestNode(args);
                     break;
                 case "check_node_update":
-                    result = this.#handleCheckNodeUpdate(args);
+                    result = await this.#handleCheckNodeUpdate(args);
                     break;
                 case "update_node":
-                    result = this.#handleUpdateNode(args);
+                    result = await this.#handleUpdateNode(args);
                     break;
                 default:
                     throw new Error(`Unknown command: ${command}`);
@@ -738,14 +738,15 @@ export class WebSocketControllerHandler implements WebServerHandler {
         throw new Error("Not implemented");
     }
 
-    #handleCheckNodeUpdate(_args: ArgsOf<"check_node_update">): ResponseOf<"check_node_update"> {
-        // Not supported currently
-        return null;
+    async #handleCheckNodeUpdate(args: ArgsOf<"check_node_update">): Promise<ResponseOf<"check_node_update">> {
+        const { node_id } = args;
+        return await this.#commandHandler.checkNodeUpdate(NodeId(node_id));
     }
 
-    #handleUpdateNode(_args: ArgsOf<"update_node">): ResponseOf<"update_node"> {
-        // Not supported currently
-        return null;
+    async #handleUpdateNode(args: ArgsOf<"update_node">): Promise<ResponseOf<"update_node">> {
+        const { nodeId, softwareVersion } = args;
+        const targetVersion = typeof softwareVersion === "string" ? parseInt(softwareVersion, 10) : softwareVersion;
+        return await this.#commandHandler.updateNode(NodeId(nodeId), targetVersion);
     }
 
     async #collectNodeDetails(nodeId: NodeId): Promise<MatterNode> {

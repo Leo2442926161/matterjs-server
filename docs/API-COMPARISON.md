@@ -8,7 +8,7 @@ This document compares the WebSocket API functionality between the original Pyth
 |----------|--------------|------------------|----------|
 | Commands | 26 | 25 implemented | ~96% |
 | Events | 9 | 9 | 100% |
-| Full functionality | - | - | ~98% |
+| Full functionality | - | - | ~99% |
 
 ---
 
@@ -82,8 +82,8 @@ This document compares the WebSocket API functionality between the original Pyth
 
 | Command | Python | Matter.js | Notes |
 |---------|--------|-----------|-------|
-| `check_node_update` | ✅ | ⚠️ | Returns null - not implemented |
-| `update_node` | ✅ | ⚠️ | Returns null - not implemented |
+| `check_node_update` | ✅ | ✅ | Queries DCL for updates, caches results from events |
+| `update_node` | ✅ | ✅ | Triggers OTA update via SoftwareUpdateManager |
 
 ### Testing/Debug Commands
 
@@ -236,23 +236,19 @@ Data Format:
 
 ---
 
-### 8. OTA Update Support (Priority: Low)
+### ~~8. OTA Update Support~~ ✅ IMPLEMENTED
+
+Both OTA commands have been implemented. See `ControllerCommandHandler.checkNodeUpdate()` and `ControllerCommandHandler.updateNode()`.
 
 **`check_node_update`:**
-- Query Matter CSA Distributed Compliance Ledger (DCL) for updates
-- Compare device's current version with available versions
-- Return update info if available
+- First checks cached updates from `updateAvailable` events
+- If not cached, queries the OTA provider's SoftwareUpdateManager
+- Returns `MatterSoftwareVersion` if update available, `null` otherwise
 
 **`update_node`:**
-- Download firmware from DCL or local source
-- Host firmware via built-in OTA Provider
-- Trigger OTA Requestor on device
-- Monitor update progress
-
-**Implementation Notes:**
-- Requires DCL API integration
-- OTA Provider already exists in Matter.js server (endpoint 1)
-- Complex multi-step process
+- Uses the OTA provider's `forceUpdate()` method
+- Triggers the update via SoftwareUpdateManager
+- Returns the update info on success
 
 ---
 
@@ -309,8 +305,7 @@ All medium-priority items have been implemented! ✅
 
 ### Low Priority (Nice to have)
 1. `ping_node` - Full implementation (currently stubbed)
-2. OTA update support (`check_node_update`, `update_node`)
-3. `import_test_node` - Testing support
+2. `import_test_node` - Testing support
 
 ---
 
