@@ -10,9 +10,12 @@ import { ControllerCommissioningFlowOptions } from "@matter/protocol";
 
 export type ReadAttributeRequest = {
     nodeId: NodeId;
-    endpointId: EndpointNumber;
-    clusterId: ClusterId;
-    attributeId: AttributeId;
+    /** Endpoint ID or undefined for wildcard */
+    endpointId?: EndpointNumber;
+    /** Cluster ID or undefined for wildcard */
+    clusterId?: ClusterId;
+    /** Attribute ID or undefined for wildcard */
+    attributeId?: AttributeId;
     fabricFiltered?: boolean;
 };
 export type AttributeResponseData = {

@@ -18,7 +18,8 @@ export interface APICommands {
     };
     set_default_fabric_label: {
         requestArgs: {
-            label: string;
+            /** Fabric label (null to clear) */
+            label: string | null;
         };
         response: null;
     };
@@ -27,7 +28,8 @@ export interface APICommands {
         response: {
             info: ServerInfoMessage;
             nodes: Array<MatterNode>;
-            events: []; // ???
+            /** Last 25 node events */
+            events: Array<MatterNodeEvent>;
         };
     };
     server_info: {
@@ -36,8 +38,10 @@ export interface APICommands {
         response: {};
     };
     get_nodes: {
-        requestArgs: {};
-        response: Array<MatterNode>; // ????
+        requestArgs: {
+            only_available?: boolean;
+        };
+        response: Array<MatterNode>;
     };
     get_node: {
         requestArgs: {
@@ -132,8 +136,11 @@ export interface APICommands {
     };
     read_attribute: {
         requestArgs: {
-            node_id: number | bigint; // ????
-            attribute_path: string;
+            node_id: number | bigint;
+            /** Single attribute path or array of paths. Supports wildcards (*) for cluster and attribute IDs. */
+            attribute_path: string | string[];
+            /** Filter by fabric (default: false) */
+            fabric_filtered?: boolean;
         };
         response: AttributesData;
     };
@@ -154,7 +161,9 @@ export interface APICommands {
     };
     ping_node: {
         requestArgs: {
-            node_id: number | bigint; // ????
+            node_id: number | bigint;
+            /** Number of ping attempts per IP address (default: 1) */
+            attempts?: number;
         };
         response: { [key: string]: boolean };
     };

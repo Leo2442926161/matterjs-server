@@ -253,8 +253,11 @@ export class ControllerCommandHandler {
         return this.#nodes.get(nodeId);
     }
 
-    setFabricLabel(label: string) {
-        return this.#controller.updateFabricLabel(label);
+    /**
+     * Set the fabric label. Pass null or empty string to clear.
+     */
+    setFabricLabel(label: string | null) {
+        return this.#controller.updateFabricLabel(label ?? "");
     }
 
     disconnectNode(nodeId: NodeId) {

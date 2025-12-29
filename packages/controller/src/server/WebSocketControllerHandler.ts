@@ -1,6 +1,5 @@
 import { ObserverGroup } from "@matter/general";
 import { AttributeId, camelize, ClusterBehavior, ClusterId, FabricIndex, Logger, Millis, NodeId } from "@matter/main";
-import { AggregatorEndpointDefinition } from "@matter/main/endpoints";
 import { ControllerCommissioningFlowOptions } from "@matter/main/protocol";
 import { EndpointNumber, getClusterById, QrPairingCodeCodec } from "@matter/main/types";
 import { Endpoint, NodeStates } from "@project-chip/matter.js/device";
@@ -37,16 +36,38 @@ import {
 
 const logger = Logger.get("WebSocketControllerHandler");
 
+/** Maximum number of events to keep in the history buffer */
+const EVENT_HISTORY_SIZE = 25;
+
 export class WebSocketControllerHandler implements WebServerHandler {
     #commandHandler: ControllerCommandHandler;
     #config: ConfigStorage;
     #wss?: WebSocketServer;
     #closed = false;
     #testNodes = new Map<bigint, MatterNode>();
+    /** Circular buffer for recent node events (max 25) */
+    #eventHistory: MatterNodeEvent[] = [];
 
     constructor(commandHandler: ControllerCommandHandler, config: ConfigStorage) {
         this.#commandHandler = commandHandler;
         this.#config = config;
+    }
+
+    /**
+     * Add an event to the history buffer, maintaining max size.
+     */
+    #addEventToHistory(event: MatterNodeEvent) {
+        this.#eventHistory.push(event);
+        if (this.#eventHistory.length > EVENT_HISTORY_SIZE) {
+            this.#eventHistory.shift();
+        }
+    }
+
+    /**
+     * Get the event history (last 25 events).
+     */
+    getEventHistory(): MatterNodeEvent[] {
+        return [...this.#eventHistory];
     }
 
     /**
@@ -133,6 +154,9 @@ export class WebSocketControllerHandler implements WebServerHandler {
                         timestamp_type: timestampType,
                         data: event.data ?? null,
                     };
+
+                    // Store event in history buffer
+                    this.#addEventToHistory(nodeEvent);
 
                     logger.info(`Sending node_event for Node ${nodeId}`, nodeEvent);
                     ws.send(toPythonJson({ event: "node_event", data: nodeEvent }));
@@ -276,7 +300,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
                     result = {
                         info: await this.#getServerInfo(),
                         nodes: await this.#handleGetNodes(args),
-                        events: [], // ???
+                        events: this.getEventHistory(),
                     };
                     break;
                 case "remove_node":
@@ -393,8 +417,10 @@ export class WebSocketControllerHandler implements WebServerHandler {
         args: ArgsOf<"set_default_fabric_label">,
     ): Promise<ResponseOf<"set_default_fabric_label">> {
         const { label } = args;
-        await this.#commandHandler.setFabricLabel(label);
-        await this.#config.set({ fabricLabel: label });
+        // Convert null to empty string (clears the label)
+        const effectiveLabel = label ?? "";
+        await this.#commandHandler.setFabricLabel(effectiveLabel);
+        await this.#config.set({ fabricLabel: effectiveLabel });
         return null;
     }
 
@@ -480,15 +506,21 @@ export class WebSocketControllerHandler implements WebServerHandler {
         return await this.#collectNodeDetails(nodeId);
     }
 
-    async #handleGetNodes(_args: ArgsOf<"get_nodes">): Promise<ResponseOf<"get_nodes">> {
+    async #handleGetNodes(args: ArgsOf<"get_nodes">): Promise<ResponseOf<"get_nodes">> {
+        const { only_available = false } = args ?? {};
         const nodeDetails = new Array<MatterNode>();
         // Include real nodes
         for (const node of this.#commandHandler.getNodeIds()) {
-            nodeDetails.push(await this.#collectNodeDetails(node));
+            const details = await this.#collectNodeDetails(node);
+            if (!only_available || details.available) {
+                nodeDetails.push(details);
+            }
         }
         // Include test nodes
         for (const testNode of this.#testNodes.values()) {
-            nodeDetails.push(testNode);
+            if (!only_available || testNode.available) {
+                nodeDetails.push(testNode);
+            }
         }
         return nodeDetails;
     }
@@ -532,43 +564,89 @@ export class WebSocketControllerHandler implements WebServerHandler {
     }
 
     async #handleReadAttribute(args: ArgsOf<"read_attribute">): Promise<ResponseOf<"read_attribute">> {
-        const { node_id: nodeId, attribute_path } = args;
+        const { node_id: nodeId, attribute_path, fabric_filtered = false } = args;
 
-        // Handle test nodes - return value from stored attributes
+        // Normalize attribute_path to array
+        const attributePaths = Array.isArray(attribute_path) ? attribute_path : [attribute_path];
+
+        // Handle test nodes - return values from stored attributes
         if (this.#isTestNode(nodeId)) {
             const testNode = this.#getTestNode(nodeId);
             if (testNode === undefined) {
                 throw ServerError.nodeNotExists(nodeId);
             }
-            logger.debug(`read_attribute called for test node ${nodeId} on path: ${attribute_path}`);
-            const value = testNode.attributes[attribute_path];
-            return { [attribute_path]: value };
+            logger.debug(
+                `read_attribute called for test node ${nodeId} on path(s): ${attributePaths.join(", ")} - fabric_filtered: ${fabric_filtered}`,
+            );
+            const result: AttributesData = {};
+            for (const path of attributePaths) {
+                // For test nodes, handle wildcards by matching all attributes
+                if (path.includes("*")) {
+                    const { endpointId, clusterId, attributeId } = splitAttributePath(path);
+                    for (const [attrPath, value] of Object.entries(testNode.attributes)) {
+                        const parts = attrPath.split("/").map(Number);
+                        if (
+                            (endpointId === undefined || parts[0] === endpointId) &&
+                            (clusterId === undefined || parts[1] === clusterId) &&
+                            (attributeId === undefined || parts[2] === attributeId)
+                        ) {
+                            result[attrPath] = value;
+                        }
+                    }
+                } else {
+                    result[path] = testNode.attributes[path];
+                }
+            }
+            return result;
         }
 
-        const { endpointId, clusterId, attributeId } = splitAttributePath(attribute_path);
-        const { values, status } = await this.#commandHandler.handleReadAttribute({
-            nodeId: NodeId(nodeId),
-            endpointId,
-            clusterId,
-            attributeId,
-        });
-        if (values.length) {
-            // Can maximal be 1
-            const { pathStr, value } = this.#convertAttributeDataToWebSocketTagBased(
-                { endpointId, clusterId, attributeId },
-                values[0].value,
-            );
-            return { [pathStr]: value };
+        const result: AttributesData = {};
+
+        // Process each attribute path
+        for (const path of attributePaths) {
+            const { endpointId, clusterId, attributeId } = splitAttributePath(path);
+
+            const { values, status } = await this.#commandHandler.handleReadAttribute({
+                nodeId: NodeId(nodeId),
+                endpointId,
+                clusterId,
+                attributeId,
+                fabricFiltered: fabric_filtered,
+            });
+
+            if (values.length) {
+                // Multiple values possible with wildcards
+                for (const valueData of values) {
+                    const { pathStr, value } = this.#convertAttributeDataToWebSocketTagBased(
+                        {
+                            endpointId: EndpointNumber(valueData.endpointId),
+                            clusterId: ClusterId(valueData.clusterId),
+                            attributeId: AttributeId(valueData.attributeId),
+                        },
+                        valueData.value,
+                    );
+                    result[pathStr] = value;
+                }
+            } else if (status && status.length > 0) {
+                logger.warn(`Failed to read attribute ${path}: status=${JSON.stringify(status)}`);
+            }
         }
-        if (status) {
-            throw new Error(`Failed to read attribute: ${status}`);
+
+        if (Object.keys(result).length === 0) {
+            throw new Error("Failed to read attribute: no values returned");
         }
-        throw new Error("Failed to read attribute");
+
+        return result;
     }
 
     async #handleWriteAttribute(args: ArgsOf<"write_attribute">): Promise<ResponseOf<"write_attribute">> {
         const { node_id: nodeId, attribute_path, value } = args;
         const { endpointId, clusterId, attributeId } = splitAttributePath(attribute_path);
+
+        // Write operations don't support wildcards
+        if (endpointId === undefined || clusterId === undefined || attributeId === undefined) {
+            throw ServerError.invalidArguments("write_attribute does not support wildcards in attribute path");
+        }
 
         // Handle test nodes - log and return success (no real write)
         if (this.#isTestNode(nodeId)) {
@@ -690,15 +768,15 @@ export class WebSocketControllerHandler implements WebServerHandler {
     }
 
     async #handlePingNode(args: ArgsOf<"ping_node">): Promise<ResponseOf<"ping_node">> {
-        const { node_id } = args;
+        const { node_id, attempts = 1 } = args;
 
         // Handle test nodes - return mock result
         if (this.#isTestNode(node_id)) {
-            logger.debug(`ping_node called for test node ${node_id}`);
+            logger.debug(`ping_node called for test node ${node_id} with ${attempts} attempts`);
             return { "0.0.0.0": true, "0000:1111:2222:3333:4444": true };
         }
 
-        return await this.#commandHandler.pingNode(NodeId(node_id));
+        return await this.#commandHandler.pingNode(NodeId(node_id), attempts);
     }
 
     async #handleRemoveNode(args: ArgsOf<"remove_node">): Promise<ResponseOf<"remove_node">> {
@@ -915,17 +993,12 @@ export class WebSocketControllerHandler implements WebServerHandler {
 
             await this.#collectAttributesFromEndpointStructure(nodeId, rootEndpoint, attributes);
 
-            const aggregatorDeviceTypeId = AggregatorEndpointDefinition.deviceType;
-            for (const key in attributes) {
-                if (key.endsWith("/29/0")) {
-                    if (!Array.isArray(attributes[key])) {
-                        continue;
-                    }
-                    if (attributes[key].some(entry => entry["0"] === aggregatorDeviceTypeId)) {
-                        isBridge = true;
-                        break;
-                    }
-                }
+            // Bridge detection: Check endpoint 1's Descriptor cluster (29) DeviceTypeList attribute (0)
+            // for device type 14 (Aggregator), matching Python Matter Server behavior
+            const endpoint1DeviceTypes = attributes["1/29/0"];
+            if (Array.isArray(endpoint1DeviceTypes)) {
+                // Device type 14 is Aggregator (bridge device)
+                isBridge = endpoint1DeviceTypes.some(entry => entry["0"] === 14);
             }
         } else {
             logger.info(`Waiting for node ${nodeId} to be initialized ${NodeStates[node.connectionState]}`);

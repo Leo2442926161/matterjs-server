@@ -421,15 +421,29 @@ export function buildAttributePath(endpointId: number, clusterId: number, attrib
     return `${endpointId}/${clusterId}/${attributeId}`;
 }
 
+/**
+ * Parse an attribute path string into its components.
+ * Supports wildcards (*) for endpoint, cluster, and attribute IDs.
+ * Non-numeric values are treated as wildcards and returned as undefined.
+ *
+ * @param path - Attribute path string in format "endpoint/cluster/attribute"
+ * @returns Object with endpointId, clusterId, attributeId - each undefined if wildcard
+ */
 export function splitAttributePath(path: string): {
-    endpointId: EndpointNumber;
-    clusterId: ClusterId;
-    attributeId: AttributeId;
+    endpointId: EndpointNumber | undefined;
+    clusterId: ClusterId | undefined;
+    attributeId: AttributeId | undefined;
 } {
-    const [endpointId, clusterId, attributeId] = path.split("/").map(Number);
+    const [endpointStr, clusterStr, attributeStr] = path.split("/");
+
+    // Non-numeric values (like "*") are treated as wildcards (undefined)
+    const endpointNum = /^\d+$/.test(endpointStr) ? parseInt(endpointStr, 10) : undefined;
+    const clusterNum = /^\d+$/.test(clusterStr) ? parseInt(clusterStr, 10) : undefined;
+    const attributeNum = /^\d+$/.test(attributeStr) ? parseInt(attributeStr, 10) : undefined;
+
     return {
-        endpointId: EndpointNumber(endpointId),
-        clusterId: ClusterId(clusterId),
-        attributeId: AttributeId(attributeId),
+        endpointId: endpointNum !== undefined ? EndpointNumber(endpointNum) : undefined,
+        clusterId: clusterNum !== undefined ? ClusterId(clusterNum) : undefined,
+        attributeId: attributeNum !== undefined ? AttributeId(attributeNum) : undefined,
     };
 }
