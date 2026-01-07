@@ -107,6 +107,8 @@ export async function waitForPort(port: number, timeoutMs = 30_000): Promise<voi
 export function waitForDeviceReady(process: ChildProcess, timeoutMs = 30_000): Promise<void> {
     return new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
+            process.stdout?.off("data", onData);
+            process.stderr?.off("data", onError);
             reject(new Error("Timeout waiting for device to be ready"));
         }, timeoutMs);
 
@@ -117,24 +119,34 @@ export function waitForDeviceReady(process: ChildProcess, timeoutMs = 30_000): P
             if (output.includes("Manual pairing code:") || output.includes("commissioned")) {
                 clearTimeout(timeout);
                 process.stdout?.off("data", onData);
+                process.stderr?.off("data", onError);
                 // Give it a moment to fully initialize network
                 setTimeout(resolve, 2000);
             }
         };
 
-        process.stdout?.on("data", onData);
-        process.stderr?.on("data", (data: Buffer) => {
+        const onError = (data: Buffer) => {
             console.log("[device:err]", data.toString().trim());
-        });
+        };
+
+        process.stdout?.on("data", onData);
+        process.stderr?.on("data", onError);
     });
 }
 
 /**
  * Gracefully kills a process and waits for it to exit.
+ * Also removes all event listeners to allow clean process exit.
  */
 export async function killProcess(process: ChildProcess | undefined, timeoutMs = 10_000): Promise<void> {
     if (!process || process.exitCode !== null) {
-        return; // Process doesn't exist or already exited
+        // Process doesn't exist or already exited - just clean up listeners
+        if (process) {
+            process.stdout?.removeAllListeners();
+            process.stderr?.removeAllListeners();
+            process.removeAllListeners();
+        }
+        return;
     }
 
     return new Promise<void>(resolve => {
@@ -144,14 +156,19 @@ export async function killProcess(process: ChildProcess | undefined, timeoutMs =
                 console.log("[killProcess] Forcing SIGKILL after timeout");
                 process.kill("SIGKILL");
             }
-            resolve();
+            cleanup();
         }, timeoutMs);
 
-        process.once("exit", () => {
+        const cleanup = () => {
             clearTimeout(timeout);
+            // Remove all listeners to allow clean process exit
+            process.stdout?.removeAllListeners();
+            process.stderr?.removeAllListeners();
+            process.removeAllListeners();
             resolve();
-        });
+        };
 
+        process.once("exit", cleanup);
         process.kill("SIGTERM");
     });
 }
