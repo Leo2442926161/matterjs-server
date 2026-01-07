@@ -48,9 +48,22 @@ export class WebServer {
     }
 
     async stop() {
-        this.#server?.close();
+        // Unregister handlers first (closes WebSocket connections)
         for (const handler of this.#handler) {
             await handler.unregister();
+        }
+
+        // Then close the HTTP server and wait for it to finish
+        if (this.#server) {
+            await new Promise<void>((resolve, reject) => {
+                this.#server!.close(err => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve();
+                    }
+                });
+            });
         }
     }
 }

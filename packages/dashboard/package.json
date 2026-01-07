@@ -19,7 +19,6 @@
         "generate": "tsx scripts/generate-descriptions.ts",
         "build": "npm run generate && matter-build && npm run bundle",
         "build-clean": "npm run generate && matter-build --clean && npm run bundle",
-        "test": "matter-test -w",
         "bundle": "rollup -c"
     },
     "devDependencies": {

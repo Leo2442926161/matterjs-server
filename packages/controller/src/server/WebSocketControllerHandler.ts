@@ -260,7 +260,19 @@ export class WebSocketControllerHandler implements WebServerHandler {
             });
         }
         this.#closed = true;
-        this.#wss?.close();
+
+        // Wait for WebSocket server to close properly
+        if (this.#wss) {
+            await new Promise<void>((resolve, reject) => {
+                this.#wss!.close(err => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve();
+                    }
+                });
+            });
+        }
     }
 
     async #handleWebSocketRequest(
