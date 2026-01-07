@@ -130,11 +130,28 @@ export function waitForDeviceReady(process: ChildProcess, timeoutMs = 30_000): P
 }
 
 /**
- * Gracefully kills a process.
+ * Gracefully kills a process and waits for it to exit.
  */
-export async function killProcess(process: ChildProcess | undefined): Promise<void> {
-    if (process) {
-        process.kill("SIGTERM");
-        await new Promise(r => setTimeout(r, 1000));
+export async function killProcess(process: ChildProcess | undefined, timeoutMs = 10_000): Promise<void> {
+    if (!process || process.exitCode !== null) {
+        return; // Process doesn't exist or already exited
     }
+
+    return new Promise<void>(resolve => {
+        const timeout = setTimeout(() => {
+            // Force kill if graceful shutdown takes too long
+            if (process.exitCode === null) {
+                console.log("[killProcess] Forcing SIGKILL after timeout");
+                process.kill("SIGKILL");
+            }
+            resolve();
+        }, timeoutMs);
+
+        process.once("exit", () => {
+            clearTimeout(timeout);
+            resolve();
+        });
+
+        process.kill("SIGTERM");
+    });
 }
