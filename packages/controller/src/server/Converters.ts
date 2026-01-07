@@ -239,7 +239,7 @@ export function parsePythonJson(json: string): unknown {
     // Pre-process: Replace large numbers (15+ digits) with marked string placeholders
     // This must happen before JSON.parse to preserve precision
     // Match numbers after colon (object values) or after [ or , (array elements)
-    const processed = json.replace(/([:,\[])\s*(\d{15,})(?=[,}\]\s])/g, (match, prefix, number) => {
+    const processed = json.replace(/([:,[])\s*(\d{15,})(?=[,}\]\s])/g, (match, prefix, number) => {
         const num = BigInt(number);
         if (num > Number.MAX_SAFE_INTEGER) {
             return `${prefix}"${BIGINT_MARKER}${number}"`;
@@ -390,31 +390,6 @@ export function getDateAsString(date: Date) {
     const microseconds = "000"; // JavaScript Date object does not support microseconds
 
     return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}.${milliseconds}${microseconds}`;
-}
-
-export function bytesToMac(bytes: Bytes): string {
-    return Bytes.toHex(bytes)
-        .match(/.{1,2}/g)!
-        .join(":");
-}
-
-export function bytesToIpV4(bytes: Bytes): string {
-    return Array.from(Bytes.of(bytes)).join(".");
-}
-
-export function bytesToIpV6(ipBytes: Bytes): string {
-    const bytes = Bytes.of(ipBytes);
-    // Convert the byte array to an array of 8 groups of 16-bit numbers
-    const groups = [];
-    for (let i = 0; i < 16; i += 2) {
-        groups.push(((bytes[i] << 8) | bytes[i + 1]).toString(16));
-    }
-
-    // Join the groups with colons
-    const ipv6 = groups.join(":");
-
-    // Compress the longest sequence of zeroes using "::"
-    return ipv6.replace(/(?:^|:)0(:0)*(:|$)/, "::");
 }
 
 export function buildAttributePath(endpointId: number, clusterId: number, attributeId: number): string {

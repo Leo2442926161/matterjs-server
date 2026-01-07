@@ -58,7 +58,7 @@ export class MatterController {
                 (await LegacyDataInjector.injectNodeData(baseStorage, legacyData.nodeData)) &&
                 legacyData.nodeData !== undefined
             ) {
-                for (const [nodeIdStr, data] of Object.entries(legacyData.nodeData!.nodes)) {
+                for (const [nodeIdStr, data] of Object.entries(legacyData.nodeData.nodes)) {
                     const { date_commissioned: commissionedAt } = data;
                     commissionedDates.set(nodeIdStr, Timestamp(new Date(commissionedAt).getTime()));
                 }
@@ -154,7 +154,7 @@ export class MatterController {
         if (this.#controllerInstance === undefined || this.#legacyCommissionedDates === undefined) {
             return;
         }
-        for (const [nodeIdStr, commissionedAt] of this.#legacyCommissionedDates!) {
+        for (const [nodeIdStr, commissionedAt] of this.#legacyCommissionedDates) {
             try {
                 const peerAddress = this.#controllerInstance.fabric.addressOf(NodeId(BigInt(nodeIdStr)));
                 const node = await this.#controllerInstance.node.peers.forAddress(peerAddress);

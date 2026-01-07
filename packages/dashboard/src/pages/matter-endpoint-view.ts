@@ -17,10 +17,10 @@ declare global {
     }
 }
 
-function getUniqueClusters(node: MatterNode, endpoint: Number) {
+function getUniqueClusters(node: MatterNode, endpoint: number) {
     return Array.from(
         new Set(
-            Object.keys(node!.attributes)
+            Object.keys(node.attributes)
                 .filter(key => key.startsWith(`${endpoint.toString()}/`))
                 .map(key => Number(key.split("/")[1])),
         ),
@@ -29,7 +29,7 @@ function getUniqueClusters(node: MatterNode, endpoint: Number) {
     });
 }
 
-export function getEndpointDeviceTypes(node: MatterNode, endpoint: Number): DeviceType[] {
+export function getEndpointDeviceTypes(node: MatterNode, endpoint: number): DeviceType[] {
     const rawValues = node.attributes[`${endpoint}/29/0`] as Record<string, number>[] | undefined;
     if (!rawValues) return [];
     return rawValues.map(rawValue => {

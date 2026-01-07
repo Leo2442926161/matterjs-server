@@ -124,7 +124,6 @@ export class TestNodeCommandHandler implements NodeCommandHandler {
      */
     importTestNodes(dump: string): NodeId[] {
         // Parse the JSON dump (handles large node IDs as BigInt)
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const dumpData = parsePythonJson(dump) as any;
 
         // Extract nodes from dump - can be single node or multiple nodes

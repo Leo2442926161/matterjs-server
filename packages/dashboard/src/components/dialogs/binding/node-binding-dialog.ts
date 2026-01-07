@@ -100,7 +100,7 @@ export class NodeBindingDialog extends LitElement {
         sourceEndpoint: number,
         entry: AccessControlEntryStruct,
     ): AccessControlEntryStruct | undefined {
-        const hasSubject = entry.subjects!.includes(nodeId);
+        const hasSubject = entry.subjects.includes(nodeId);
         if (!hasSubject) return entry;
 
         const hasTarget = entry.targets!.filter(item => item.endpoint === sourceEndpoint);

@@ -4,16 +4,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { fixupConfigRules, fixupPluginRules } from "@eslint/compat";
 import { FlatCompat } from "@eslint/eslintrc";
 import js from "@eslint/js";
-import typescriptEslint from "@typescript-eslint/eslint-plugin";
 import tsParser from "@typescript-eslint/parser";
-import _import from "eslint-plugin-import";
-import nodeImport from "eslint-plugin-node-import";
+import regexp from "eslint-plugin-regexp";
+import { globalIgnores } from "eslint/config";
 import globals from "globals";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript-eslint";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -24,31 +23,29 @@ const compat = new FlatCompat({
 });
 
 export default [
-    {
-        ignores: [
-            "*/node_modules/**/*",
-            "*/dist/**/*",
-            "*/build/**/*",
-        ],
-    },
-    ...fixupConfigRules(
-        compat.extends(
-            "eslint:recommended",
-            "plugin:@typescript-eslint/recommended",
-            "plugin:@typescript-eslint/recommended-requiring-type-checking",
-            "plugin:import/errors",
-            "plugin:import/warnings",
-            "plugin:import/typescript",
-            "plugin:regexp/recommended",
-        ),
-    ),
-    {
-        plugins: {
-            "@typescript-eslint": fixupPluginRules(typescriptEslint),
-            import: fixupPluginRules(_import),
-            "node-import": fixupPluginRules(nodeImport),
-        },
+    globalIgnores([
+        "**/dist/**/*",
+        "**/build/**/*",
+        "**/forwards/**/*",
+        "**/bin/*",
+        "**/require/*",
+        "compat/**",
+        "models/*/**/*",
+        "docs/**/*",
+        "**/.mocharc.cjs",
+        "eslint.config.mjs",
 
+        // Even with allowJs and inclusion of **/*.cjs eslint complains these files aren't found by the project service.  We
+        // hardly have any, and they are small and very specialized.  So just ignore them
+        "**/*.cjs",
+        "**/*.mjs",
+        "utils/*.js",
+    ]),
+    js.configs.recommended,
+    ...ts.configs.recommendedTypeChecked,
+    regexp.configs["flat/recommended"],
+
+    {
         linterOptions: {
             reportUnusedDisableDirectives: true,
         },
@@ -63,15 +60,7 @@ export default [
             sourceType: "module",
 
             parserOptions: {
-                project: ["./packages/*/tsconfig.json"],
-            },
-        },
-
-        settings: {
-            "import/extensions": [".ts"],
-
-            "import/parsers": {
-                "@typescript-eslint/parser": [".ts"],
+                projectService: [],
             },
         },
 
@@ -88,6 +77,7 @@ export default [
             "@typescript-eslint/no-unsafe-call": "off",
             "@typescript-eslint/restrict-template-expressions": "off",
             "@typescript-eslint/no-base-to-string": "off",
+            "@typescript-eslint/await-thenable": "off",
 
             "no-constant-condition": [
                 "error",
@@ -112,10 +102,6 @@ export default [
                 },
             ],
 
-            // This is not released yet so using separate plugin temporarily
-            //"import/enforce-node-protocol-usage": "error",
-            "node-import/prefer-node-protocol": "error",
-
             "@typescript-eslint/no-namespace": "off",
             "no-inner-declarations": "off",
             "no-case-declarations": "off",
@@ -130,6 +116,10 @@ export default [
             "no-ex-assign": "off",
             "@typescript-eslint/no-redundant-type-constituents": "off",
             "import/no-unresolved": "off",
+            "regexp/optimal-quantifier-concatenation": "off",
+            "no-sparse-arrays": "off",
+            "@typescript-eslint/no-unsafe-function-type": "off",
+            "no-unexpected-multiline": "off",
         },
     },
     {
@@ -137,6 +127,20 @@ export default [
         files: ["**/test/**/*.ts"],
         rules: {
             "@typescript-eslint/no-unused-expressions": "off",
+        },
+    },
+    {
+        // Dashboard uses Lit which has patterns that trigger floating promises warnings
+        // TODO Adjust that?
+        files: ["packages/dashboard/**/*.ts"],
+        rules: {
+            "@typescript-eslint/no-floating-promises": "off",
+        },
+    },
+    {
+        files: ["**/*.cjs"],
+        rules: {
+            "@typescript-eslint/no-require-imports": "off",
         },
     },
 ];

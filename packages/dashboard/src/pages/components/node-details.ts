@@ -20,7 +20,7 @@ import { getEndpointDeviceTypes } from "../matter-endpoint-view.js";
 import { bindingContext } from "./context.js";
 
 function getNodeDeviceTypes(node: MatterNode): DeviceType[] {
-    const uniqueEndpoints = new Set(Object.keys(node!.attributes).map(key => Number(key.split("/")[0])));
+    const uniqueEndpoints = new Set(Object.keys(node.attributes).map(key => Number(key.split("/")[0])));
     const allDeviceTypes: Set<DeviceType> = new Set();
     uniqueEndpoints.forEach(endpointId => {
         getEndpointDeviceTypes(node, endpointId).forEach(deviceType => {
@@ -160,7 +160,7 @@ export class NodeDetails extends LitElement {
 
     private async _binding() {
         try {
-            showNodeBindingDialog(this.client!, this.node!, this.endpoint!);
+            showNodeBindingDialog(this.client, this.node!, this.endpoint);
         } catch (err: any) {
             console.log(err);
         }

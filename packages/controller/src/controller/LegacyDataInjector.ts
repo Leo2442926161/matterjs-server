@@ -18,7 +18,8 @@ import { convertWebSocketTagBasedToMatter } from "../server/Converters.js";
 
 const logger = Logger.get("LegacyDataInjector");
 
-const BASE64_REGEX = /^([0-9a-zA-Z+/]{4})*(([0-9a-zA-Z+/]{2}==)|([0-9a-zA-Z+/]{3}=))?$/;
+/* eslint-disable regexp/no-unused-capturing-group */
+const BASE64_REGEX = /^([0-9a-z+/]{4})*(([0-9a-z+/]{2}==)|([0-9a-z+/]{3}=))?$/i;
 
 /**
  * Fabric configuration data extracted from chip.json.

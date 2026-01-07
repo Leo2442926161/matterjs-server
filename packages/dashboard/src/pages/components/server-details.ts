@@ -77,16 +77,16 @@ export class ServerDetails extends LitElement {
         ) {
             return;
         }
-        // @ts-ignore:next-line
+        // @ts-expect-error why?
         const fileElem = this.renderRoot.getElementById("fileElem") as HTMLInputElement;
-        fileElem!.click();
+        fileElem.click();
     }
 
     private _onFileInput = (event: Event) => {
         const fileElem = event.target as HTMLInputElement;
         if (fileElem.files!.length > 0) {
             const selectedFile = fileElem.files![0];
-            var reader = new FileReader();
+            const reader = new FileReader();
             reader.readAsText(selectedFile, "UTF-8");
             reader.onload = async () => {
                 try {

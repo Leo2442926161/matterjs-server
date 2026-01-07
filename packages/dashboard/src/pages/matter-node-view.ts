@@ -21,7 +21,7 @@ declare global {
 
 function getUniqueEndpoints(node: MatterNode) {
     // extract unique endpoints from the node attributes, as (sorted) array
-    return Array.from(new Set(Object.keys(node!.attributes).map(key => Number(key.split("/")[0])))).sort((a, b) => {
+    return Array.from(new Set(Object.keys(node.attributes).map(key => Number(key.split("/")[0])))).sort((a, b) => {
         return a - b;
     });
 }

@@ -6,9 +6,12 @@
 
 import { AsyncObservable } from "@matter/general";
 import {
+    Bytes,
     ClusterBehavior,
     FabricId,
     FabricIndex,
+    ipv4BytesToString,
+    ipv6BytesToString,
     Logger,
     Millis,
     NodeId,
@@ -60,8 +63,6 @@ import { Endpoint, NodeStates, PairedNode } from "@project-chip/matter.js/device
 import { ClusterMap, ClusterMapEntry } from "../model/ModelMapper.js";
 import {
     buildAttributePath,
-    bytesToIpV4,
-    bytesToIpV6,
     convertMatterToWebSocketTagBased,
     getDateAsString,
     splitAttributePath,
@@ -940,8 +941,8 @@ export class ControllerCommandHandler {
                     if (interfaces.length) {
                         logger.info(`Found ${interfaces.length} operational network interfaces`, interfaces);
                         interfaces.forEach(({ iPv4Addresses, iPv6Addresses }) => {
-                            iPv4Addresses.forEach(ip => addresses.add(bytesToIpV4(ip)));
-                            iPv6Addresses.forEach(ip => addresses.add(bytesToIpV6(ip)));
+                            iPv4Addresses.forEach(ip => addresses.add(ipv4BytesToString(Bytes.of(ip))));
+                            iPv6Addresses.forEach(ip => addresses.add(ipv6BytesToString(Bytes.of(ip))));
                         });
                     }
                 }

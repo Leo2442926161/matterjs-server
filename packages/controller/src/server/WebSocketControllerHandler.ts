@@ -269,7 +269,6 @@ export class WebSocketControllerHandler implements WebServerHandler {
         let messageId: string | undefined;
         try {
             logger.info("Received WebSocket request", data);
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const request = parsePythonJson(data) as { message_id: string; command: string; args: any };
             const { command, args } = request;
             messageId = request.message_id;

@@ -229,7 +229,7 @@ async function stop() {
     process.exit(0);
 }
 
-start();
+start().catch(err => console.error(err));
 
 process.on("SIGINT", () => void stop().catch(err => console.error(err)));
 process.on("SIGTERM", () => void stop().catch(err => console.error(err)));

@@ -60,10 +60,10 @@ export class MatterClient {
         // code: The QR Code or Manual Pairing Code for device commissioning.
         // network_only: If True, restricts device discovery to network only.
         // Returns: The NodeInfo of the commissioned device.
-        return (await this.sendCommand("commission_with_code", 0, {
+        return await this.sendCommand("commission_with_code", 0, {
             code: code,
             network_only: networkOnly,
-        })) as MatterNode;
+        });
     }
 
     async setWifiCredentials(ssid: string, credentials: string) {
@@ -85,24 +85,24 @@ export class MatterClient {
     ): Promise<CommissioningParameters> {
         // Open a commissioning window to commission a device present on this controller to another.
         // Returns code to use as discriminator.
-        return (await this.sendCommand("open_commissioning_window", 0, {
+        return await this.sendCommand("open_commissioning_window", 0, {
             node_id: nodeId,
             timeout,
             iteration,
             option,
             discriminator,
-        })) as CommissioningParameters;
+        });
     }
 
     async discoverCommissionableNodes(): Promise<CommissionableNodeData[]> {
         // Discover Commissionable Nodes (discovered on BLE or mDNS).
-        return (await this.sendCommand("discover_commissionable_nodes", 0, {})) as CommissionableNodeData[];
+        return await this.sendCommand("discover_commissionable_nodes", 0, {});
     }
 
     async getMatterFabrics(nodeId: number | bigint): Promise<MatterFabricData[]> {
         // Get Matter fabrics from a device.
         // Returns a list of MatterFabricData objects.
-        return (await this.sendCommand("get_matter_fabrics", 3, { node_id: nodeId })) as MatterFabricData[];
+        return await this.sendCommand("get_matter_fabrics", 3, { node_id: nodeId });
     }
 
     async removeMatterFabric(nodeId: number | bigint, fabricIndex: number) {
@@ -112,16 +112,16 @@ export class MatterClient {
 
     async pingNode(nodeId: number | bigint): Promise<NodePingResult> {
         // Ping node on the currently known IP-address(es).
-        return (await this.sendCommand("ping_node", 0, { node_id: nodeId })) as NodePingResult;
+        return await this.sendCommand("ping_node", 0, { node_id: nodeId });
     }
 
     async getNodeIPAddresses(nodeId: number | bigint, preferCache?: boolean, scoped?: boolean): Promise<string[]> {
         // Return the currently known (scoped) IP-address(es).
-        return (await this.sendCommand("get_node_ip_addresses", 8, {
+        return await this.sendCommand("get_node_ip_addresses", 8, {
             node_id: nodeId,
             prefer_cache: preferCache,
             scoped: scoped,
-        })) as string[];
+        });
     }
 
     async removeNode(nodeId: number | bigint) {
@@ -166,7 +166,6 @@ export class MatterClient {
         await this.sendCommand("update_node", 10, { node_id: nodeId, software_version: softwareVersion });
     }
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     async setACLEntry(nodeId: number | bigint, entry: any[]) {
         return await this.sendCommand("set_acl_entry", 0, {
             node_id: nodeId,
@@ -174,7 +173,6 @@ export class MatterClient {
         });
     }
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     async setNodeBinding(nodeId: number | bigint, endpoint: number, bindings: any[]) {
         return await this.sendCommand("set_node_binding", 0, {
             node_id: nodeId,
@@ -183,7 +181,7 @@ export class MatterClient {
         });
     }
 
-    async sendCommand<T extends keyof APICommands>(
+    sendCommand<T extends keyof APICommands>(
         command: T,
         require_schema: number | undefined = undefined,
         args: APICommands[T]["requestArgs"],
@@ -212,11 +210,9 @@ export class MatterClient {
             this.connection.sendMessage(message);
         });
 
-        messagePromise.finally(() => {
+        return messagePromise.finally(() => {
             delete this._result_futures[messageId];
         });
-
-        return messagePromise;
     }
 
     async connect() {

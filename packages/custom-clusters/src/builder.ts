@@ -1,4 +1,4 @@
-import { camelize, capitalize, Identity } from "@matter/main";
+import { camelize, capitalize } from "@matter/main";
 import { ClusterModel, ElementTag, GLOBAL_IDS } from "@matter/main/model";
 import { ClusterType, MutableCluster, OptionalAttribute, TlvOfModel } from "@matter/main/types";
 
@@ -22,11 +22,11 @@ export function ClusterTypeOfModel(model: ClusterModel) {
             continue;
         }
         const name = camelize(attr.name);
+        // TODO resect mandatory flag when needed
         cluster.attributes![name] = OptionalAttribute(id, TlvOfModel(attr));
     }
 
     // TODO also add events and commands when needed
 
-    const ClusterInstance = MutableCluster(cluster);
-    return ClusterInstance as Identity<typeof ClusterInstance>;
+    return MutableCluster(cluster);
 }
