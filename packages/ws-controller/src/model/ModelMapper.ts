@@ -83,5 +83,5 @@ MatterModel.standard.clusters.forEach(cluster => {
     clusterMapBuilder[cluster.id] = clusterData;
 });
 
-/** Readonly map of all clusters, frozen after initialization */
+/** Readonly map of all clusters frozen after initialization */
 export const ClusterMap: ClusterMapType = Object.freeze(clusterMapBuilder);

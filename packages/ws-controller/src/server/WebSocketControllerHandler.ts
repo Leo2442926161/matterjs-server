@@ -45,6 +45,7 @@ const EVENT_HISTORY_SIZE = 25;
 
 const SCHEMA_VERSION = 11;
 
+/** WebSocket Server compatible with Schema version 11 */
 export class WebSocketControllerHandler implements WebServerHandler {
     #controller: MatterController;
     #commandHandler: ControllerCommandHandler;
@@ -55,7 +56,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
     /** Circular buffer for recent node events (max 25) */
     #eventHistory: MatterNodeEvent[] = [];
     /** Track when each node was last interviewed (connected) - keyed by nodeId */
-    #lastInterviewDates = new Map<bigint, Date>();
+    #lastInterviewDates = new Map<NodeId, Date>();
 
     constructor(controller: MatterController, config: ConfigStorage) {
         this.#controller = controller;
@@ -105,14 +106,14 @@ export class WebSocketControllerHandler implements WebServerHandler {
                     case "node_updated":
                         this.#collectNodeDetails(nodeId).then(
                             nodeDetails => {
-                                logger.info(`Sending ${eventName} event for Node ${nodeId}`, nodeDetails);
+                                logger.debug(`Sending ${eventName} event for Node ${nodeId}`, nodeDetails);
                                 ws.send(toBigIntAwareJson({ event: eventName, data: nodeDetails }));
                             },
                             err => logger.error(`Failed to collect node details for Node ${nodeId}`, err),
                         );
                         break;
                     case "node_removed":
-                        logger.info(`Sending node_removed event for Node ${nodeId}`);
+                        logger.debug(`Sending node_removed event for Node ${nodeId}`);
                         ws.send(toBigIntAwareJson({ event: eventName, data: nodeId }));
                         break;
                 }
@@ -130,7 +131,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
                     clusterData?.attributes[attributeId],
                     clusterData?.model,
                 );
-                logger.info(`Sending attribute_updated event for Node ${nodeId}`, pathStr, value);
+                logger.debug(`Sending attribute_updated event for Node ${nodeId}`, pathStr, value);
                 ws.send(toBigIntAwareJson({ event: "attribute_updated", data: [nodeId, pathStr, value] }));
             });
 
@@ -166,10 +167,10 @@ export class WebSocketControllerHandler implements WebServerHandler {
                         data: event.data ?? null,
                     };
 
-                    // Store event in history buffer
+                    // Store event in the history buffer
                     this.#addEventToHistory(nodeEvent);
 
-                    logger.info(`Sending node_event for Node ${nodeId}`, nodeEvent);
+                    logger.debug(`Sending node_event for Node ${nodeId}`, nodeEvent);
                     ws.send(toBigIntAwareJson({ event: "node_event", data: nodeEvent }));
                 }
             });
@@ -182,7 +183,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
                 if (state === NodeStates.Disconnected) return;
                 // Track last interview time when node becomes connected
                 if (state === NodeStates.Connected) {
-                    this.#lastInterviewDates.set(BigInt(nodeId), new Date());
+                    this.#lastInterviewDates.set(nodeId, new Date());
                 }
                 sendNodeDetailsEvent("node_updated", nodeId);
             });
@@ -239,7 +240,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
                                 listening = true;
                             }
                             const responseStr = toBigIntAwareJson(response);
-                            logger.info("Sending WebSocket response", responseStr);
+                            logger.debug("Sending WebSocket response", responseStr);
                             ws.send(toBigIntAwareJson(response));
                         },
                         err => logger.error("Websocket request error", err),
@@ -277,7 +278,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
         }
         this.#closed = true;
 
-        // Wait for WebSocket server to close properly
+        // Wait for the WebSocket server to close properly
         if (this.#wss) {
             await new Promise<void>((resolve, reject) => {
                 this.#wss!.close(err => {
@@ -296,7 +297,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
     ): Promise<{ response: ErrorResultMessage | SuccessResultMessage<any>; enableListeners?: boolean }> {
         let messageId: string | undefined;
         try {
-            logger.info("Received WebSocket request", data);
+            logger.debug("Received WebSocket request", data);
             const request = parseBigIntAwareJson(data) as { message_id: string; command: string; args: any };
             const { command, args } = request;
             messageId = request.message_id;
@@ -470,7 +471,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
     ): Promise<ResponseOf<"set_default_fabric_label">> {
         const { label } = args;
         // Use "Home" as default when null/empty is passed (matter.js requires non-empty labels)
-        const effectiveLabel = label && label.trim() !== "" ? label : "Home";
+        const effectiveLabel = label && label.trim() !== "" ? label.trim() : "Home";
         await this.#commandHandler.setFabricLabel(effectiveLabel);
         await this.#config.set({ fabricLabel: effectiveLabel });
         return null;
@@ -493,11 +494,13 @@ export class WebSocketControllerHandler implements WebServerHandler {
             }
             if (this.#config.threadDataset) {
                 threadCredentials = {
-                    networkName: "WeNeedOOneToScan??!!", // TODO
+                    networkName: "", // Thread network name is not needed when providing operational dataset
                     operationalDataset: this.#config.threadDataset,
                 };
             }
         }
+
+        await this.#config.set({ nextNodeId: nextNodeId + 1 });
 
         const { nodeId } = await this.#commandHandler.commissionNode({
             nodeId: NodeId(nextNodeId),
@@ -506,7 +509,6 @@ export class WebSocketControllerHandler implements WebServerHandler {
             wifiCredentials,
             threadCredentials,
         });
-        await this.#config.set({ nextNodeId: nextNodeId + 1 });
 
         return await this.#collectNodeDetails(nodeId);
     }
@@ -539,7 +541,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
                     throw ServerError.invalidArguments("filter required for filter_type 2 (long discriminator)");
                 commissionRequest = { ...baseRequest, passcode: setup_pin_code, longDiscriminator: filter };
                 break;
-            case 3: // Vendor ID (requires product ID too, but Python server only passes vendor ID)
+            case 3: // Vendor ID (requires product ID too, but Python server only passes vendor ID)  // TODO, will basically never work!
                 if (filter === undefined)
                     throw ServerError.invalidArguments("filter required for filter_type 3 (vendor ID)");
                 commissionRequest = { ...baseRequest, passcode: setup_pin_code, vendorId: filter, productId: 0 };
@@ -552,8 +554,9 @@ export class WebSocketControllerHandler implements WebServerHandler {
                 break;
         }
 
-        const { nodeId } = await this.#commandHandler.commissionNode(commissionRequest);
         await this.#config.set({ nextNodeId: nextNodeId + 1 });
+
+        const { nodeId } = await this.#commandHandler.commissionNode(commissionRequest);
 
         return await this.#collectNodeDetails(nodeId);
     }
@@ -586,10 +589,9 @@ export class WebSocketControllerHandler implements WebServerHandler {
             throw ServerError.nodeNotExists(node_id);
         }
 
-        // Pass last interview date for real nodes
-        const lastInterviewDate = this.#lastInterviewDates.get(BigInt(node_id));
+        // Pass the last interview date for real nodes
         if (handler === this.#commandHandler) {
-            return await this.#commandHandler.getNodeDetails(nodeId, lastInterviewDate);
+            return await this.#commandHandler.getNodeDetails(nodeId, this.#lastInterviewDates.get(nodeId));
         }
         return await handler.getNodeDetails(nodeId);
     }
@@ -757,7 +759,11 @@ export class WebSocketControllerHandler implements WebServerHandler {
         const { ssid, credentials } = args;
         await this.#config.set({ wifiSsid: ssid, wifiCredentials: credentials });
         // Broadcast server_info_updated event to notify clients of credential change
-        this.#broadcastServerInfoUpdated().catch(err => logger.warn("Failed to broadcast server info update", err));
+        try {
+            await this.#broadcastServerInfoUpdated();
+        } catch (error) {
+            logger.warn("Failed to broadcast server info update", error);
+        }
         return {};
     }
 
@@ -765,7 +771,11 @@ export class WebSocketControllerHandler implements WebServerHandler {
         const { dataset } = args;
         await this.#config.set({ threadDataset: dataset });
         // Broadcast server_info_updated event to notify clients of credential change
-        this.#broadcastServerInfoUpdated().catch(err => logger.warn("Failed to broadcast server info update", err));
+        try {
+            await this.#broadcastServerInfoUpdated();
+        } catch (error) {
+            logger.warn("Failed to broadcast server info update", error);
+        }
         return {};
     }
 
@@ -878,7 +888,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
     }
 
     async #collectNodeDetails(nodeId: NodeId): Promise<MatterNode> {
-        const lastInterviewDate = this.#lastInterviewDates.get(BigInt(nodeId));
+        const lastInterviewDate = this.#lastInterviewDates.get(nodeId);
         return await this.#commandHandler.getNodeDetails(nodeId, lastInterviewDate);
     }
 

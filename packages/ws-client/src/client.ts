@@ -24,19 +24,19 @@ import { MatterNode } from "./models/node.js";
 /** Union type for all incoming WebSocket messages */
 type IncomingMessage = EventMessage | ErrorResultMessage | SuccessResultMessage;
 
-/** Converts node_id to number for use as object key (bigint can't be used as index) */
-function toNodeKey(nodeId: number | bigint): number {
-    return typeof nodeId === "bigint" ? Number(nodeId) : nodeId;
+/** Converts node_id to string for use as object key (works for both number and bigint without precision loss) */
+function toNodeKey(nodeId: number | bigint): string {
+    return String(nodeId);
 }
 
 export class MatterClient {
     public connection: Connection;
-    public nodes: Record<number, MatterNode> = {};
+    public nodes: Record<string, MatterNode> = {};
     public serverBaseAddress: string;
     /** Whether this client is connected to a production server (optional, for UI purposes) */
     public isProduction: boolean = false;
     // Using 'unknown' for resolve since the actual types vary by command
-    private _result_futures: Record<string, { resolve: (value: unknown) => void; reject: (reason?: unknown) => void }> =
+    private result_futures: Record<string, { resolve: (value: unknown) => void; reject: (reason?: unknown) => void }> =
         {};
     private msgId = 0;
     private eventListeners: Record<string, Array<() => void>> = {};
@@ -260,7 +260,7 @@ export class MatterClient {
 
         const messagePromise = new Promise<APICommands[T]["response"]>((resolve, reject) => {
             // Type-erased storage: resolve/reject are stored as unknown handlers
-            this._result_futures[messageId] = {
+            this.result_futures[messageId] = {
                 resolve: resolve as (value: unknown) => void,
                 reject,
             };
@@ -268,7 +268,7 @@ export class MatterClient {
         });
 
         return messagePromise.finally(() => {
-            delete this._result_futures[messageId];
+            delete this.result_futures[messageId];
         });
     }
 
@@ -298,7 +298,7 @@ export class MatterClient {
 
         const nodesArray = await this.sendCommand("start_listening", 0, {});
 
-        const nodes: Record<number, MatterNode> = {};
+        const nodes: Record<string, MatterNode> = {};
         for (const node of nodesArray) {
             nodes[toNodeKey(node.node_id)] = new MatterNode(node);
         }
@@ -312,19 +312,19 @@ export class MatterClient {
         }
 
         if ("error_code" in msg) {
-            const promise = this._result_futures[msg.message_id];
+            const promise = this.result_futures[msg.message_id];
             if (promise) {
                 promise.reject(new Error(msg.details));
-                delete this._result_futures[msg.message_id];
+                delete this.result_futures[msg.message_id];
             }
             return;
         }
 
         if ("result" in msg) {
-            const promise = this._result_futures[msg.message_id];
+            const promise = this.result_futures[msg.message_id];
             if (promise) {
                 promise.resolve(msg.result);
-                delete this._result_futures[msg.message_id];
+                delete this.result_futures[msg.message_id];
             }
             return;
         }
