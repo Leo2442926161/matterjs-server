@@ -19,6 +19,7 @@ import {
     Seconds,
     ServerAddress,
     ServerAddressUdp,
+    SoftwareUpdateInfo,
     SoftwareUpdateManager,
 } from "@matter/main";
 import {
@@ -100,19 +101,6 @@ import {
     UpdateSource,
 } from "../types/WebSocketMessageTypes.js";
 import { pingIp } from "../util/network.js";
-
-/**
- * Software update info from the OTA provider.
- * Matches the SoftwareUpdateInfo interface from @matter/node.
- */
-interface SoftwareUpdateInfo {
-    vendorId: VendorId;
-    productId: number;
-    softwareVersion: number;
-    softwareVersionString: string;
-    releaseNotesUrl?: string;
-    specificationVersion?: number;
-}
 
 const logger = Logger.get("ControllerCommandHandler");
 
@@ -1200,7 +1188,7 @@ export class ControllerCommandHandler {
         // First check if we have a cached update from the updateAvailable event
         const cachedUpdate = this.#availableUpdates.get(nodeId);
         if (cachedUpdate) {
-            return this.#convertToMatterSoftwareVersion(cachedUpdate, UpdateSource.MAIN_NET_DCL);
+            return this.#convertToMatterSoftwareVersion(cachedUpdate);
         }
 
         // No cached update, query the OTA provider
@@ -1235,16 +1223,8 @@ export class ControllerCommandHandler {
 
             if (nodeUpdate) {
                 const { info } = nodeUpdate;
-                // Cache the update for future use
-                const updateInfo: SoftwareUpdateInfo = {
-                    vendorId: info.vendorId,
-                    productId: info.productId,
-                    softwareVersion: info.softwareVersion,
-                    softwareVersionString: info.softwareVersionString,
-                };
-                this.#availableUpdates.set(nodeId, updateInfo);
-
-                return this.#convertToMatterSoftwareVersion(updateInfo, UpdateSource.MAIN_NET_DCL);
+                this.#availableUpdates.set(nodeId, info);
+                return this.#convertToMatterSoftwareVersion(info);
             }
 
             return null;
@@ -1299,7 +1279,7 @@ export class ControllerCommandHandler {
             );
 
             // Return the update info
-            return this.#convertToMatterSoftwareVersion(updateInfo, UpdateSource.MAIN_NET_DCL);
+            return this.#convertToMatterSoftwareVersion(updateInfo);
         } catch (error) {
             logger.error(`Failed to update node ${nodeId}:`, error);
             throw error;
@@ -1309,16 +1289,22 @@ export class ControllerCommandHandler {
     /**
      * Convert SoftwareUpdateInfo to MatterSoftwareVersion format for WebSocket API.
      */
-    #convertToMatterSoftwareVersion(updateInfo: SoftwareUpdateInfo, updateSource: UpdateSource): MatterSoftwareVersion {
+    #convertToMatterSoftwareVersion(updateInfo: SoftwareUpdateInfo): MatterSoftwareVersion {
+        const { vendorId, productId, softwareVersion, softwareVersionString, releaseNotesUrl, source } = updateInfo;
         return {
-            vid: updateInfo.vendorId,
-            pid: updateInfo.productId,
-            software_version: updateInfo.softwareVersion,
-            software_version_string: updateInfo.softwareVersionString,
+            vid: vendorId,
+            pid: productId,
+            software_version: softwareVersion,
+            software_version_string: softwareVersionString,
             min_applicable_software_version: 0, // Not available from SoftwareUpdateInfo
-            max_applicable_software_version: updateInfo.softwareVersion - 1,
-            release_notes_url: updateInfo.releaseNotesUrl,
-            update_source: updateSource,
+            max_applicable_software_version: softwareVersion - 1,
+            release_notes_url: releaseNotesUrl,
+            update_source:
+                source === "dcl-prod"
+                    ? UpdateSource.MAIN_NET_DCL
+                    : source === "dcl-test"
+                      ? UpdateSource.TEST_NET_DCL
+                      : UpdateSource.LOCAL,
         };
     }
 }
