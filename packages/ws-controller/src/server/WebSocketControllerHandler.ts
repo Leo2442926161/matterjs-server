@@ -5,8 +5,8 @@
  */
 
 import { ObserverGroup } from "@matter/general";
-import { camelize, ClusterId, FabricIndex, Logger, Millis, NodeId } from "@matter/main";
-import { ControllerCommissioningFlowOptions } from "@matter/main/protocol";
+import { camelize, ClientNodeInteraction, ClusterId, FabricIndex, Logger, Millis, NodeId } from "@matter/main";
+import { ControllerCommissioningFlowOptions, Read } from "@matter/main/protocol";
 import { EndpointNumber, getClusterById, QrPairingCodeCodec } from "@matter/main/types";
 import { NodeStates } from "@project-chip/matter.js/device";
 import { WebSocketServer } from "ws";
@@ -721,7 +721,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
         const { node_id } = args;
         const nodeId = NodeId(node_id);
 
-        // Handle test nodes - just broadcast node_updated event
+        // Handle test nodes - just broadcast the node_updated event
         if (TestNodeCommandHandler.isTestNodeId(node_id)) {
             const testNode = this.#testNodeHandler.getNode(nodeId);
             if (testNode === undefined) {
@@ -740,9 +740,19 @@ export class WebSocketControllerHandler implements WebServerHandler {
         // Our nodes are kept up-to-date via attribute subscriptions, so we don't need
         // to re-read all attributes like the Python server does.
         // Just emit a node_updated event with the current (already fresh) data.
-        logger.info(`Interview requested for node ${nodeId} - emitting node_updated event`);
+        logger.info(`Interview requested for node ${nodeId} - do a complete read`);
 
-        // Emit node_updated event (same as Python server behavior after interview)
+        // Do a full Read of the node
+        const read = {
+            ...Read({
+                fabricFilter: true,
+                attributes: [{}],
+            }),
+            includeKnownVersions: true, // do not send DataVersionFilters, so we do a new clean read
+        };
+        for await (const _chunk of (node.node.interaction as ClientNodeInteraction).read(read));
+
+        // Emit node_updated event (same as Python server behavior after the interview)
         this.#commandHandler.events.nodeStateChanged.emit(nodeId, node.connectionState);
 
         return null;
