@@ -23,7 +23,7 @@ if (!url || !command) {
     console.error("");
     console.error("Examples:");
     console.error("  npx ts-node send-command.ts ws://localhost:5580/ws server_info");
-    console.error('  npx ts-node send-command.ts ws://localhost:5580/ws get_node \'{"node_id": 1}\'');
+    console.error("  npx ts-node send-command.ts ws://localhost:5580/ws get_node '{\"node_id\": 1}'");
     console.error("  npx ts-node send-command.ts ws://localhost:5580/ws start_listening");
     process.exit(1);
 }
