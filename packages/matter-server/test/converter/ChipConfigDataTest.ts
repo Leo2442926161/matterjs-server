@@ -568,7 +568,7 @@ describe("ChipConfigData", () => {
     });
 
     describe("real chip.json", () => {
-        it("should load the actual .ha1/chip.json file with all TLV decoded", async () => {
+        it("should load the test chip.json file with all TLV decoded", async () => {
             const chipJsonPath = FIXTURE_CHIP_JSON;
 
             const config = new ChipConfigData();

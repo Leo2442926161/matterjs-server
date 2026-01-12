@@ -78,10 +78,10 @@ The server is started on port localhost:5580 and listens fpr WS on "/ws"
 Configure the HA instance against this server and have fun :-)
 
 ### Tips
-* to control the storage directory use `--storage-path .ha1` as parameter to use local dir `.ha1` for storage
+* to control the storage directory use `--storage-path data` as parameter to use local dir `data` for storage
 * to limit network interfaces (especially good idea on Macs sometimes) use `--primary-interface en0`
 
-So as example to do both use `npm run server -- --storage-path .ha1 --primary-interface en0` (note the extra "--" to pass parameters to the script).
+So as example to do both use `npm run server -- --storage-path data --primary-interface en0` (note the extra "--" to pass parameters to the script).
 
 It was in general tested with a simply slight bulb on network.
 
