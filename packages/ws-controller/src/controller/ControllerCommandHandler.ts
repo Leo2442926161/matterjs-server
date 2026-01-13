@@ -7,6 +7,7 @@
 import { AsyncObservable, isObject } from "@matter/general";
 import {
     Bytes,
+    ClientNodeInteraction,
     ClusterBehavior,
     FabricId,
     FabricIndex,
@@ -30,17 +31,16 @@ import {
     OperationalCredentials,
 } from "@matter/main/clusters";
 import {
-    ClusterClientObj,
     DecodedAttributeReportValue,
     DecodedEventReportValue,
     PeerAddress,
+    Read,
     SignatureFromCommandSpec,
     SupportedTransportsSchema,
 } from "@matter/main/protocol";
 import {
     Attribute,
     ClusterId,
-    ClusterType,
     Command,
     DeviceTypeId,
     EndpointNumber,
@@ -62,8 +62,7 @@ import {
     VendorId,
 } from "@matter/main/types";
 import { CommissioningController, NodeCommissioningOptions } from "@project-chip/matter.js";
-import { InteractionClient } from "@project-chip/matter.js/cluster";
-import { Endpoint, NodeStates, PairedNode } from "@project-chip/matter.js/device";
+import { Endpoint, NodeStates } from "@project-chip/matter.js/device";
 import { ClusterMap, ClusterMapEntry } from "../model/ModelMapper.js";
 import {
     buildAttributePath,
@@ -105,7 +104,7 @@ import {
     UpdateSource,
 } from "../types/WebSocketMessageTypes.js";
 import { pingIp } from "../util/network.js";
-import { AttributeDataCache } from "./AttributeDataCache.js";
+import { Nodes } from "./Nodes.js";
 
 const logger = Logger.get("ControllerCommandHandler");
 
@@ -115,11 +114,10 @@ export class ControllerCommandHandler {
     #connected = false;
     #bleEnabled = false;
     #otaEnabled = false;
-    #nodes = new Map<NodeId, PairedNode>();
+    /** Node management and attribute cache */
+    #nodes = new Nodes();
     /** Cache of available updates keyed by nodeId */
     #availableUpdates = new Map<NodeId, SoftwareUpdateInfo>();
-    /** Cache of node attributes in WebSocket format for fast retrieval */
-    #attributeCache = new AttributeDataCache();
     events = {
         started: new AsyncObservable(),
         attributeChanged: new Observable<[nodeId: NodeId, data: DecodedAttributeReportValue<any>]>(),
@@ -213,11 +211,12 @@ export class ControllerCommandHandler {
 
     async #registerNode(nodeId: NodeId) {
         const node = await this.#controller.getNode(nodeId);
+        const attributeCache = this.#nodes.attributeCache;
 
         // Wire all Events to the Event emitters
         node.events.attributeChanged.on(data => {
             // Update the attribute cache with the new value in WebSocket format
-            this.#attributeCache.updateAttribute(nodeId, data);
+            attributeCache.updateAttribute(nodeId, data);
             // Then emit the event for listeners
             this.events.attributeChanged.emit(nodeId, data);
         });
@@ -225,14 +224,14 @@ export class ControllerCommandHandler {
         node.events.stateChanged.on(state => {
             // Only refresh cache on Connected state (not Reconnecting, WaitingForDiscovery, etc.)
             if (state === NodeStates.Connected) {
-                this.#attributeCache.update(node);
+                attributeCache.update(node);
             }
             this.events.nodeStateChanged.emit(nodeId, state);
         });
         node.events.structureChanged.on(() => {
             // Structure changed means endpoints may have been added/removed, refresh cache
             if (node.isConnected) {
-                this.#attributeCache.update(node);
+                attributeCache.update(node);
             }
             this.events.nodeStructureChanged.emit(nodeId);
         });
@@ -245,7 +244,7 @@ export class ControllerCommandHandler {
 
         // Initialize attribute cache if node is already initialized
         if (node.initialized) {
-            this.#attributeCache.add(node);
+            attributeCache.add(node);
         }
 
         return node;
@@ -280,15 +279,7 @@ export class ControllerCommandHandler {
     }
 
     getNodeIds() {
-        return Array.from(this.#nodes.keys());
-    }
-
-    getNode(nodeId: NodeId) {
-        const node = this.#nodes.get(nodeId);
-        if (node === undefined) {
-            throw new Error(`Node ${nodeId} not found`);
-        }
-        return node;
+        return this.#nodes.getIds();
     }
 
     hasNode(nodeId: NodeId): boolean {
@@ -302,34 +293,26 @@ export class ControllerCommandHandler {
         return this.decommissionNode(nodeId);
     }
 
-    interactionClientForNode(nodeId: NodeId): Promise<InteractionClient> {
-        return this.getNode(nodeId).getInteractionClient();
-    }
+    async interviewNode(nodeId: NodeId) {
+        const node = this.#nodes.get(nodeId);
 
-    clusterClientByIdForNode(nodeId: NodeId, endpointId: EndpointNumber, clusterId: ClusterId): ClusterClientObj<any> {
-        const node = this.getNode(nodeId);
+        // Our nodes are kept up-to-date via attribute subscriptions, so we don't need
+        // to re-read all attributes like the Python server does.
+        // Just emit a node_updated event with the current (already fresh) data.
+        logger.info(`Interview requested for node ${nodeId} - do a complete read`);
 
-        const endpoint = endpointId === 0 ? node.getRootEndpoint() : node.getDeviceById(endpointId);
+        // Do a full Read of the node
+        const read = {
+            ...Read({
+                fabricFilter: true,
+                attributes: [{}],
+            }),
+            includeKnownVersions: true, // do not send DataVersionFilters, so we do a new clean read
+        };
+        for await (const _chunk of (node.node.interaction as ClientNodeInteraction).read(read));
 
-        if (endpoint === undefined) {
-            throw new Error(`Endpoint ${endpointId} on node ${nodeId} not found`);
-        }
-
-        const client = endpoint.getClusterClientById(clusterId);
-
-        if (client === undefined) {
-            throw new Error(`Cluster ${clusterId} on endpoint ${endpointId} on node ${nodeId} not found`);
-        }
-
-        return client;
-    }
-
-    clusterClientForNode<const T extends ClusterType>(
-        nodeId: NodeId,
-        endpointId: EndpointNumber,
-        cluster: T,
-    ): ClusterClientObj<T> {
-        return this.clusterClientByIdForNode(nodeId, endpointId, cluster.id) as ClusterClientObj<T>;
+        // Emit node_updated event (same as Python server behavior after the interview)
+        this.events.nodeStateChanged.emit(nodeId, node.connectionState);
     }
 
     /**
@@ -338,17 +321,18 @@ export class ControllerCommandHandler {
      * @param lastInterviewDate Optional last interview date (tracked externally)
      */
     async getNodeDetails(nodeId: NodeId, lastInterviewDate?: Date): Promise<MatterNodeData> {
-        const node = this.getNode(nodeId);
+        const node = this.#nodes.get(nodeId);
+        const attributeCache = this.#nodes.attributeCache;
 
         let isBridge = false;
 
         // Ensure the cache is populated if node is initialized but cache doesn't exist yet
-        if (!this.#attributeCache.has(nodeId)) {
-            this.#attributeCache.add(node);
+        if (!attributeCache.has(nodeId)) {
+            attributeCache.add(node);
         }
 
         // Get cached attributes (empty object if node not yet initialized)
-        const attributes = this.#attributeCache.get(nodeId) ?? {};
+        const attributes = attributeCache.get(nodeId) ?? {};
 
         // Bridge detection: Check endpoint 1's Descriptor cluster (29) DeviceTypeList attribute (0)
         // for device type 14 (Aggregator), matching Python Matter Server behavior
@@ -382,7 +366,7 @@ export class ControllerCommandHandler {
         attributePaths: string[],
         fabricFiltered = false,
     ): Promise<AttributesData> {
-        const node = this.getNode(nodeId);
+        const node = this.#nodes.get(nodeId);
 
         const result: AttributesData = {};
 
@@ -519,7 +503,7 @@ export class ControllerCommandHandler {
 
     async handleReadAttribute(data: ReadAttributeRequest): Promise<ReadAttributeResponse> {
         const { nodeId, endpointId, clusterId, attributeId, fabricFiltered = true } = data;
-        const client = await this.interactionClientForNode(nodeId);
+        const client = await this.#nodes.interactionClientFor(nodeId);
 
         // Note: This method is for direct SDK reads with explicit paths.
         // Wildcard handling is done at the WebSocket layer before calling this method.
@@ -550,7 +534,7 @@ export class ControllerCommandHandler {
 
     async handleReadEvent(data: ReadEventRequest): Promise<ReadEventResponse> {
         const { nodeId, endpointId, clusterId, eventId, eventMin } = data;
-        const client = await this.interactionClientForNode(nodeId);
+        const client = await this.#nodes.interactionClientFor(nodeId);
         const { eventData, eventStatus } = await client.getMultipleEventsAndStatus({
             events: [
                 {
@@ -584,7 +568,7 @@ export class ControllerCommandHandler {
 
     async handleSubscribeAttribute(data: SubscribeAttributeRequest): Promise<SubscribeAttributeResponse> {
         const { nodeId, endpointId, clusterId, attributeId, minInterval, maxInterval, changeListener } = data;
-        const client = await this.interactionClientForNode(nodeId);
+        const client = await this.#nodes.interactionClientFor(nodeId);
         const updated = Observable<[void]>();
         let ignoreData = true; // We ignore data coming in during initial seeding
         const { attributeReports = [] } = await client.subscribeMultipleAttributesAndEvents({
@@ -630,7 +614,7 @@ export class ControllerCommandHandler {
 
     async handleSubscribeEvent(data: SubscribeEventRequest): Promise<SubscribeEventResponse> {
         const { nodeId, endpointId, clusterId, eventId, minInterval, maxInterval, changeListener } = data;
-        const client = await this.interactionClientForNode(nodeId);
+        const client = await this.#nodes.interactionClientFor(nodeId);
         const updated = Observable<[void]>();
         let ignoreData = true; // We ignore data coming in during initial seeding
         const { eventReports = [] } = await client.subscribeMultipleAttributesAndEvents({
@@ -679,7 +663,7 @@ export class ControllerCommandHandler {
     async handleWriteAttribute(data: WriteAttributeRequest): Promise<AttributeResponseStatus> {
         const { nodeId, endpointId, clusterId, attributeId, value } = data;
 
-        const client = this.clusterClientByIdForNode(nodeId, endpointId, clusterId);
+        const client = this.#nodes.clusterClientByIdFor(nodeId, endpointId, clusterId);
 
         logger.info("Writing attribute", attributeId, "with value", value);
         try {
@@ -713,7 +697,7 @@ export class ControllerCommandHandler {
         } = data;
         let { data: commandData } = data;
 
-        const client = this.clusterClientByIdForNode(nodeId, endpointId, clusterId);
+        const client = this.#nodes.clusterClientByIdFor(nodeId, endpointId, clusterId);
 
         if (!client[commandName] || !client.isCommandSupportedByName(commandName)) {
             throw new Error("Command not existing");
@@ -737,7 +721,7 @@ export class ControllerCommandHandler {
     /** InvokeById minimalistic handler because only used for error testing */
     async handleInvokeById(data: InvokeByIdRequest): Promise<void> {
         const { nodeId, endpointId, clusterId, commandId, data: commandData, timedInteractionTimeoutMs } = data;
-        const client = await this.interactionClientForNode(nodeId);
+        const client = await this.#nodes.interactionClientFor(nodeId);
         await client.invoke<Command<any, any, any>>({
             endpointId,
             clusterId: clusterId,
@@ -754,7 +738,7 @@ export class ControllerCommandHandler {
     async handleWriteAttributeById(data: WriteAttributeByIdRequest): Promise<void> {
         const { nodeId, endpointId, clusterId, attributeId, value } = data;
 
-        const client = await this.interactionClientForNode(nodeId);
+        const client = await this.#nodes.interactionClientFor(nodeId);
 
         logger.info("Writing attribute", attributeId, "with value", value);
 
@@ -939,7 +923,7 @@ export class ControllerCommandHandler {
     }
 
     async getNodeIpAddresses(nodeId: NodeId, preferCache = true) {
-        const node = this.getNode(nodeId);
+        const node = this.#nodes.get(nodeId);
         const addresses = new Set<string>();
         const generalDiag = node.getRootClusterClient(GeneralDiagnosticsCluster);
         if (generalDiag) {
@@ -969,7 +953,7 @@ export class ControllerCommandHandler {
      * @returns A record of IP addresses to ping success status
      */
     async pingNode(nodeId: NodeId, attempts = 1): Promise<NodePingResult> {
-        const node = this.getNode(nodeId);
+        const node = this.#nodes.get(nodeId);
 
         const result: NodePingResult = {};
 
@@ -1009,24 +993,23 @@ export class ControllerCommandHandler {
     }
 
     async decommissionNode(nodeId: NodeId) {
-        const node = this.hasNode(nodeId) ? this.getNode(nodeId) : undefined;
+        const node = this.#nodes.has(nodeId) ? this.#nodes.get(nodeId) : undefined;
         await this.#controller.removeNode(nodeId, !!node?.isConnected);
+        // Remove node from storage (also clears attribute cache)
         this.#nodes.delete(nodeId);
-        // Clear the attribute cache for the removed node
-        this.#attributeCache.delete(nodeId);
         // Emit nodeDecommissioned event after successful removal
         this.events.nodeDecommissioned.emit(nodeId);
     }
 
     async openCommissioningWindow(data: OpenCommissioningWindowRequest): Promise<OpenCommissioningWindowResponse> {
         const { nodeId, timeout } = data;
-        const node = this.getNode(nodeId);
+        const node = this.#nodes.get(nodeId);
         const { manualPairingCode, qrPairingCode } = await node.openEnhancedCommissioningWindow(timeout);
         return { manualCode: manualPairingCode, qrCode: qrPairingCode };
     }
 
     async getFabrics(nodeId: NodeId) {
-        const client = this.clusterClientForNode(nodeId, EndpointNumber(0), OperationalCredentials.Cluster);
+        const client = this.#nodes.clusterClientFor(nodeId, EndpointNumber(0), OperationalCredentials.Cluster);
 
         return (await client.getFabricsAttribute(true, false)).map(({ fabricId, fabricIndex, vendorId, label }) => ({
             fabricId,
@@ -1037,7 +1020,7 @@ export class ControllerCommandHandler {
     }
 
     removeFabric(nodeId: NodeId, fabricIndex: FabricIndex) {
-        const client = this.clusterClientForNode(nodeId, EndpointNumber(0), OperationalCredentials.Cluster);
+        const client = this.#nodes.clusterClientFor(nodeId, EndpointNumber(0), OperationalCredentials.Cluster);
 
         return client.removeFabric({ fabricIndex });
     }
@@ -1047,7 +1030,7 @@ export class ControllerCommandHandler {
      * Writes to the ACL attribute on the AccessControl cluster (endpoint 0).
      */
     async setAclEntry(nodeId: NodeId, entries: AccessControlEntry[]): Promise<AttributeWriteResult[] | null> {
-        const client = this.clusterClientForNode(nodeId, EndpointNumber(0), AccessControl.Cluster);
+        const client = this.#nodes.clusterClientFor(nodeId, EndpointNumber(0), AccessControl.Cluster);
 
         // Convert from WebSocket format (snake_case) to Matter.js format (camelCase)
         const aclEntries: AccessControl.AccessControlEntry[] = entries.map(entry => ({
@@ -1101,7 +1084,7 @@ export class ControllerCommandHandler {
         endpointId: EndpointNumber,
         bindings: BindingTarget[],
     ): Promise<AttributeWriteResult[] | null> {
-        const client = this.clusterClientForNode(nodeId, endpointId, Binding.Cluster);
+        const client = this.#nodes.clusterClientFor(nodeId, endpointId, Binding.Cluster);
 
         // Convert from WebSocket format to Matter.js format
         const bindingEntries: Binding.Target[] = bindings.map(binding => ({
@@ -1156,7 +1139,7 @@ export class ControllerCommandHandler {
         }
 
         // No cached update, query the OTA provider
-        const node = this.getNode(nodeId);
+        const node = this.#nodes.get(nodeId);
 
         try {
             const otaProvider = this.#controller.otaProvider;
@@ -1201,7 +1184,7 @@ export class ControllerCommandHandler {
         if (!this.#otaEnabled) {
             throw new Error("OTA is disabled.");
         }
-        if (!this.hasNode(nodeId)) {
+        if (!this.#nodes.has(nodeId)) {
             throw new Error(`Node ${nodeId} not found`);
         }
 

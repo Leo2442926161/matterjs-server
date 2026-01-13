@@ -228,11 +228,6 @@ export interface NodeCommandHandler {
     hasNode(nodeId: NodeId): boolean;
 
     /**
-     * Get all node IDs managed by this handler.
-     */
-    getNodeIds(): NodeId[];
-
-    /**
      * Get full node details in WebSocket API format.
      */
     getNodeDetails(nodeId: NodeId): Promise<MatterNodeData>;

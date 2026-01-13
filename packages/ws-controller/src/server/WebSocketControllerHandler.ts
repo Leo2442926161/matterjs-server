@@ -5,8 +5,8 @@
  */
 
 import { ObserverGroup } from "@matter/general";
-import { camelize, ClientNodeInteraction, ClusterId, FabricIndex, Logger, Millis, NodeId } from "@matter/main";
-import { ControllerCommissioningFlowOptions, Read } from "@matter/main/protocol";
+import { camelize, ClusterId, FabricIndex, Logger, Millis, NodeId } from "@matter/main";
+import { ControllerCommissioningFlowOptions } from "@matter/main/protocol";
 import { EndpointNumber, getClusterById, QrPairingCodeCodec } from "@matter/main/types";
 import { NodeStates } from "@project-chip/matter.js/device";
 import { WebSocketServer } from "ws";
@@ -726,38 +726,17 @@ export class WebSocketControllerHandler implements WebServerHandler {
         const nodeId = NodeId(node_id);
 
         // Handle test nodes - just broadcast the node_updated event
-        if (TestNodeCommandHandler.isTestNodeId(node_id)) {
+        if (TestNodeCommandHandler.isTestNodeId(nodeId)) {
             const testNode = this.#testNodeHandler.getNode(nodeId);
             if (testNode === undefined) {
-                throw ServerError.nodeNotExists(node_id);
+                throw ServerError.nodeNotExists(nodeId);
             }
-            logger.debug(`interview_node called for test node ${node_id}`);
+            logger.debug(`interview_node called for test node ${nodeId}`);
             this.#broadcastEvent("node_updated", testNode);
             return null;
         }
 
-        const node = this.#commandHandler.getNode(nodeId);
-        if (node === undefined) {
-            throw ServerError.nodeNotExists(node_id);
-        }
-
-        // Our nodes are kept up-to-date via attribute subscriptions, so we don't need
-        // to re-read all attributes like the Python server does.
-        // Just emit a node_updated event with the current (already fresh) data.
-        logger.info(`Interview requested for node ${nodeId} - do a complete read`);
-
-        // Do a full Read of the node
-        const read = {
-            ...Read({
-                fabricFilter: true,
-                attributes: [{}],
-            }),
-            includeKnownVersions: true, // do not send DataVersionFilters, so we do a new clean read
-        };
-        for await (const _chunk of (node.node.interaction as ClientNodeInteraction).read(read));
-
-        // Emit node_updated event (same as Python server behavior after the interview)
-        this.#commandHandler.events.nodeStateChanged.emit(nodeId, node.connectionState);
+        await this.#commandHandler.interviewNode(nodeId);
 
         return null;
     }
