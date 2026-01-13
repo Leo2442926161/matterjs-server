@@ -102,6 +102,7 @@ import {
     UpdateSource,
 } from "../types/WebSocketMessageTypes.js";
 import { pingIp } from "../util/network.js";
+import { AttributeDataCache } from "./AttributeDataCache.js";
 
 const logger = Logger.get("ControllerCommandHandler");
 
@@ -114,6 +115,8 @@ export class ControllerCommandHandler {
     #nodes = new Map<NodeId, PairedNode>();
     /** Cache of available updates keyed by nodeId */
     #availableUpdates = new Map<NodeId, SoftwareUpdateInfo>();
+    /** Cache of node attributes in WebSocket format for fast retrieval */
+    #attributeCache = new AttributeDataCache();
     events = {
         started: new AsyncObservable(),
         attributeChanged: new Observable<[nodeId: NodeId, data: DecodedAttributeReportValue<any>]>(),
@@ -209,16 +212,38 @@ export class ControllerCommandHandler {
         const node = await this.#controller.getNode(nodeId);
 
         // Wire all Events to the Event emitters
-        node.events.attributeChanged.on(data => this.events.attributeChanged.emit(node.nodeId, data));
-        node.events.eventTriggered.on(data => this.events.eventChanged.emit(node.nodeId, data));
-        node.events.stateChanged.on(state => this.events.nodeStateChanged.emit(node.nodeId, state));
-        node.events.structureChanged.on(() => this.events.nodeStructureChanged.emit(node.nodeId));
-        node.events.decommissioned.on(() => this.events.nodeDecommissioned.emit(node.nodeId));
-        node.events.nodeEndpointAdded.on(endpointId => this.events.nodeEndpointAdded.emit(node.nodeId, endpointId));
-        node.events.nodeEndpointRemoved.on(endpointId => this.events.nodeEndpointRemoved.emit(node.nodeId, endpointId));
+        node.events.attributeChanged.on(data => {
+            // Update the attribute cache with the new value in WebSocket format
+            this.#attributeCache.updateAttribute(nodeId, data);
+            // Then emit the event for listeners
+            this.events.attributeChanged.emit(nodeId, data);
+        });
+        node.events.eventTriggered.on(data => this.events.eventChanged.emit(nodeId, data));
+        node.events.stateChanged.on(state => {
+            // Only refresh cache on Connected state (not Reconnecting, WaitingForDiscovery, etc.)
+            if (state === NodeStates.Connected) {
+                this.#attributeCache.update(node);
+            }
+            this.events.nodeStateChanged.emit(nodeId, state);
+        });
+        node.events.structureChanged.on(() => {
+            // Structure changed means endpoints may have been added/removed, refresh cache
+            if (node.isConnected) {
+                this.#attributeCache.update(node);
+            }
+            this.events.nodeStructureChanged.emit(nodeId);
+        });
+        node.events.decommissioned.on(() => this.events.nodeDecommissioned.emit(nodeId));
+        node.events.nodeEndpointAdded.on(endpointId => this.events.nodeEndpointAdded.emit(nodeId, endpointId));
+        node.events.nodeEndpointRemoved.on(endpointId => this.events.nodeEndpointRemoved.emit(nodeId, endpointId));
 
         // Store the node for direct access
         this.#nodes.set(nodeId, node);
+
+        // Initialize attribute cache if node is already initialized
+        if (node.initialized) {
+            this.#attributeCache.add(node);
+        }
 
         return node;
     }
@@ -282,22 +307,20 @@ export class ControllerCommandHandler {
         }
 
         let isBridge = false;
-        const attributes: AttributesData = {};
 
-        if (node.initialized) {
-            const rootEndpoint = node.getRootEndpoint();
-            if (rootEndpoint !== undefined) {
-                this.#collectAttributesFromEndpoint(rootEndpoint, attributes);
+        // Ensure the cache is populated if node is initialized but cache doesn't exist yet
+        if (!this.#attributeCache.has(nodeId)) {
+            this.#attributeCache.add(node);
+        }
 
-                // Bridge detection: Check endpoint 1's Descriptor cluster (29) DeviceTypeList attribute (0)
-                // for device type 14 (Aggregator), matching Python Matter Server behavior
-                const endpoint1DeviceTypes = attributes["1/29/0"];
-                if (Array.isArray(endpoint1DeviceTypes)) {
-                    isBridge = endpoint1DeviceTypes.some(entry => entry["0"] === 14);
-                }
-            }
-        } else {
-            logger.info(`Waiting for node ${nodeId} to be initialized ${NodeStates[node.connectionState]}`);
+        // Get cached attributes (empty object if node not yet initialized)
+        const attributes = this.#attributeCache.get(nodeId) ?? {};
+
+        // Bridge detection: Check endpoint 1's Descriptor cluster (29) DeviceTypeList attribute (0)
+        // for device type 14 (Aggregator), matching Python Matter Server behavior
+        const endpoint1DeviceTypes = attributes["1/29/0"];
+        if (Array.isArray(endpoint1DeviceTypes)) {
+            isBridge = endpoint1DeviceTypes.some(entry => entry["0"] === 14);
         }
 
         // Get commissioned date from node state if available
@@ -1010,6 +1033,8 @@ export class ControllerCommandHandler {
         const node = this.getNode(nodeId);
         await this.#controller.removeNode(NodeId(BigInt(nodeId)), !!node?.isConnected);
         this.#nodes.delete(nodeId);
+        // Clear the attribute cache for the removed node
+        this.#attributeCache.delete(nodeId);
         // Emit nodeDecommissioned event after successful removal
         this.events.nodeDecommissioned.emit(nodeId);
     }
