@@ -5,7 +5,7 @@
  */
 
 import { AttributeId, Bytes, camelize, ClusterId, isObject, Logger } from "@matter/main";
-import { ClusterModel, CommandModel, FieldValue, ValueModel } from "@matter/main/model";
+import { ClusterModel, FieldValue, ValueModel } from "@matter/main/model";
 import { EndpointNumber, MATTER_EPOCH_OFFSET_S, MATTER_EPOCH_OFFSET_US } from "@matter/main/types";
 
 const logger = new Logger("ChipToolWebSocketHandler");
@@ -19,50 +19,7 @@ export function parseNumber(number: string): number | bigint {
     return parsed;
 }
 
-/**
- * Converts tag-based WebSocket data (with numeric keys) back to Matter.js data format (with camelCased names).
- * This is the reverse of convertMatterToWebSocketTagBased.
- */
-export function convertWebSocketTagBasedToMatter(
-    value: unknown,
-    model: ValueModel | undefined,
-    clusterModel: ClusterModel,
-): unknown {
-    if (model === undefined || value === null) {
-        return value; // Return null/undefined values as-is
-    }
-
-    // Handle lists
-    if (Array.isArray(value) && model.type === "list") {
-        return value.map(v => convertWebSocketTagBasedToMatter(v, model.members[0], clusterModel));
-    }
-
-    // Handle structs - convert numeric keys to camelCased member names
-    if (isObject(value) && model.metabase?.name === "struct") {
-        const valueKeys = Object.keys(value);
-        const result: { [key: string]: unknown } = {};
-
-        // Build a map of member ID to member for efficient lookup
-        const memberById: { [id: number]: ValueModel } = {};
-        for (const member of model.members) {
-            if (member.id !== undefined) {
-                memberById[member.id] = member;
-            }
-        }
-
-        for (const key of valueKeys) {
-            const memberId = parseInt(key);
-            if (!isNaN(memberId) && memberById[memberId]) {
-                const member = memberById[memberId];
-                result[camelize(member.name)] = convertWebSocketTagBasedToMatter(value[key], member, clusterModel);
-            } else {
-                // Keep unknown keys as-is (fallback for unknown attributes)
-                result[key] = value[key];
-            }
-        }
-        return result;
-    }
-
+function convertWebSocketGenericToMatter(value: unknown, model: ValueModel, clusterModel: ClusterModel) {
     // Handle bitmaps - convert number to object with boolean flags
     if (typeof value === "number" && model.metabase?.metatype === "bitmap") {
         const bitmapValue: { [key: string]: boolean | number } = {};
@@ -118,32 +75,96 @@ export function convertWebSocketTagBasedToMatter(
     return value;
 }
 
-export function convertCommandArgumentToMatter(
-    value: Record<string, unknown>,
-    model: CommandModel,
+/**
+ * Converts tag-based WebSocket data (with numeric keys) back to Matter.js data format (with camelCased names).
+ * This is the reverse of convertMatterToWebSocketTagBased.
+ */
+export function convertWebSocketTagBasedToMatter(
+    value: unknown,
+    model: ValueModel | undefined,
     clusterModel: ClusterModel,
 ): unknown {
-    const valueKeys = Object.keys(value);
-    const result: { [key: string]: unknown } = {};
-
-    // Build a map of member ID to member for efficient lookup
-    const memberByName: { [name: string]: ValueModel } = {};
-    for (const member of model.members) {
-        if (member.name !== undefined) {
-            memberByName[camelize(member.name)] = member;
-        }
+    if (model === undefined || value === null) {
+        return value; // Return null/undefined values as-is
     }
 
-    for (const key of valueKeys) {
-        if (memberByName[key]) {
-            const member = memberByName[key];
-            result[key] = convertWebSocketTagBasedToMatter(value[key], member, clusterModel);
-        } else {
-            // Keep unknown keys as-is (fallback for unknown attributes)
-            result[key] = value[key];
-        }
+    // Handle lists
+    if (Array.isArray(value) && model.type === "list") {
+        return value.map(v => convertWebSocketTagBasedToMatter(v, model.members[0], clusterModel));
     }
-    return result;
+
+    // Handle structs - convert numeric keys to camelCased member names
+    if (isObject(value) && model.metabase?.name === "struct") {
+        const valueKeys = Object.keys(value);
+        const result: { [key: string]: unknown } = {};
+
+        // Build a map of member ID to member for efficient lookup
+        const memberById: { [id: number]: ValueModel } = {};
+        for (const member of model.members) {
+            if (member.id !== undefined) {
+                memberById[member.id] = member;
+            }
+        }
+
+        for (const key of valueKeys) {
+            const memberId = parseInt(key);
+            if (!isNaN(memberId) && memberById[memberId]) {
+                const member = memberById[memberId];
+                result[camelize(member.name)] = convertWebSocketTagBasedToMatter(value[key], member, clusterModel);
+            } else {
+                // Keep unknown keys as-is (fallback for unknown attributes)
+                result[key] = value[key];
+            }
+        }
+        return result;
+    }
+
+    return convertWebSocketGenericToMatter(value, model, clusterModel);
+}
+
+/**
+ * Converts camelized name-based WebSocket data to Matter.js data format. Mainly to ensure binary and epoch data
+ */
+export function convertCommandDataToMatter(
+    value: unknown,
+    model: ValueModel | undefined,
+    clusterModel: ClusterModel,
+): unknown {
+    if (model === undefined || value === null) {
+        return value; // Return null/undefined values as-is
+    }
+
+    // Handle lists
+    if (Array.isArray(value) && model.type === "list") {
+        return value.map(v => convertCommandDataToMatter(v, model.members[0], clusterModel));
+    }
+
+    // Handle structs - convert numeric keys to camelCased member names
+    if (isObject(value) && model.metabase?.name === "struct") {
+        const valueKeys = Object.keys(value);
+        const result: { [key: string]: unknown } = {};
+
+        // Build a map of member ID to member for efficient lookup
+        const memberByName: { [name: string]: ValueModel } = {};
+        for (const member of model.members) {
+            if (member.name !== undefined) {
+                memberByName[camelize(member.name)] = member;
+            }
+        }
+
+        for (const key of valueKeys) {
+            if (memberByName[key]) {
+                const member = memberByName[key];
+                result[key] = convertWebSocketTagBasedToMatter(value[key], member, clusterModel);
+            } else {
+                // Keep unknown keys as-is (fallback for unknown attributes)
+                result[key] = value[key];
+            }
+        }
+        return result;
+    }
+
+    return convertWebSocketGenericToMatter(value, model, clusterModel);
 }
 
 /**

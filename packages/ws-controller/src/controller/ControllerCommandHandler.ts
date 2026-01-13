@@ -30,6 +30,7 @@ import {
     OperationalCredentials,
 } from "@matter/main/clusters";
 import {
+    ClusterClientObj,
     DecodedAttributeReportValue,
     DecodedEventReportValue,
     PeerAddress,
@@ -39,6 +40,7 @@ import {
 import {
     Attribute,
     ClusterId,
+    ClusterType,
     Command,
     DeviceTypeId,
     EndpointNumber,
@@ -60,11 +62,12 @@ import {
     VendorId,
 } from "@matter/main/types";
 import { CommissioningController, NodeCommissioningOptions } from "@project-chip/matter.js";
+import { InteractionClient } from "@project-chip/matter.js/cluster";
 import { Endpoint, NodeStates, PairedNode } from "@project-chip/matter.js/device";
 import { ClusterMap, ClusterMapEntry } from "../model/ModelMapper.js";
 import {
     buildAttributePath,
-    convertCommandArgumentToMatter,
+    convertCommandDataToMatter,
     convertMatterToWebSocketTagBased,
     getDateAsString,
     splitAttributePath,
@@ -281,7 +284,11 @@ export class ControllerCommandHandler {
     }
 
     getNode(nodeId: NodeId) {
-        return this.#nodes.get(nodeId);
+        const node = this.#nodes.get(nodeId);
+        if (node === undefined) {
+            throw new Error(`Node ${nodeId} not found`);
+        }
+        return node;
     }
 
     hasNode(nodeId: NodeId): boolean {
@@ -295,16 +302,43 @@ export class ControllerCommandHandler {
         return this.decommissionNode(nodeId);
     }
 
+    interactionClientForNode(nodeId: NodeId): Promise<InteractionClient> {
+        return this.getNode(nodeId).getInteractionClient();
+    }
+
+    clusterClientByIdForNode(nodeId: NodeId, endpointId: EndpointNumber, clusterId: ClusterId): ClusterClientObj<any> {
+        const node = this.getNode(nodeId);
+
+        const endpoint = endpointId === 0 ? node.getRootEndpoint() : node.getDeviceById(endpointId);
+
+        if (endpoint === undefined) {
+            throw new Error(`Endpoint ${endpointId} on node ${nodeId} not found`);
+        }
+
+        const client = endpoint.getClusterClientById(clusterId);
+
+        if (client === undefined) {
+            throw new Error(`Cluster ${clusterId} on endpoint ${endpointId} on node ${nodeId} not found`);
+        }
+
+        return client;
+    }
+
+    clusterClientForNode<const T extends ClusterType>(
+        nodeId: NodeId,
+        endpointId: EndpointNumber,
+        cluster: T,
+    ): ClusterClientObj<T> {
+        return this.clusterClientByIdForNode(nodeId, endpointId, cluster.id) as ClusterClientObj<T>;
+    }
+
     /**
      * Get full node details in WebSocket API format.
      * @param nodeId The node ID
      * @param lastInterviewDate Optional last interview date (tracked externally)
      */
     async getNodeDetails(nodeId: NodeId, lastInterviewDate?: Date): Promise<MatterNodeData> {
-        const node = this.#nodes.get(nodeId);
-        if (node === undefined) {
-            throw new Error(`Node ${nodeId} not found`);
-        }
+        const node = this.getNode(nodeId);
 
         let isBridge = false;
 
@@ -348,10 +382,7 @@ export class ControllerCommandHandler {
         attributePaths: string[],
         fabricFiltered = false,
     ): Promise<AttributesData> {
-        const node = this.#nodes.get(nodeId);
-        if (node === undefined) {
-            throw new Error(`Node ${nodeId} not found`);
-        }
+        const node = this.getNode(nodeId);
 
         const result: AttributesData = {};
 
@@ -488,11 +519,7 @@ export class ControllerCommandHandler {
 
     async handleReadAttribute(data: ReadAttributeRequest): Promise<ReadAttributeResponse> {
         const { nodeId, endpointId, clusterId, attributeId, fabricFiltered = true } = data;
-        const node = this.getNode(nodeId);
-        if (node === undefined) {
-            throw new Error("Node not found");
-        }
-        const client = await node.getInteractionClient();
+        const client = await this.interactionClientForNode(nodeId);
 
         // Note: This method is for direct SDK reads with explicit paths.
         // Wildcard handling is done at the WebSocket layer before calling this method.
@@ -523,11 +550,7 @@ export class ControllerCommandHandler {
 
     async handleReadEvent(data: ReadEventRequest): Promise<ReadEventResponse> {
         const { nodeId, endpointId, clusterId, eventId, eventMin } = data;
-        const node = this.getNode(nodeId);
-        if (node === undefined) {
-            throw new Error("Node not found");
-        }
-        const client = await node.getInteractionClient();
+        const client = await this.interactionClientForNode(nodeId);
         const { eventData, eventStatus } = await client.getMultipleEventsAndStatus({
             events: [
                 {
@@ -561,11 +584,7 @@ export class ControllerCommandHandler {
 
     async handleSubscribeAttribute(data: SubscribeAttributeRequest): Promise<SubscribeAttributeResponse> {
         const { nodeId, endpointId, clusterId, attributeId, minInterval, maxInterval, changeListener } = data;
-        const node = this.getNode(nodeId);
-        if (node === undefined) {
-            throw new Error("Node not found");
-        }
-        const client = await node.getInteractionClient();
+        const client = await this.interactionClientForNode(nodeId);
         const updated = Observable<[void]>();
         let ignoreData = true; // We ignore data coming in during initial seeding
         const { attributeReports = [] } = await client.subscribeMultipleAttributesAndEvents({
@@ -611,11 +630,7 @@ export class ControllerCommandHandler {
 
     async handleSubscribeEvent(data: SubscribeEventRequest): Promise<SubscribeEventResponse> {
         const { nodeId, endpointId, clusterId, eventId, minInterval, maxInterval, changeListener } = data;
-        const node = this.getNode(nodeId);
-        if (node === undefined) {
-            throw new Error("Node not found");
-        }
-        const client = await node.getInteractionClient();
+        const client = await this.interactionClientForNode(nodeId);
         const updated = Observable<[void]>();
         let ignoreData = true; // We ignore data coming in during initial seeding
         const { eventReports = [] } = await client.subscribeMultipleAttributesAndEvents({
@@ -664,19 +679,7 @@ export class ControllerCommandHandler {
     async handleWriteAttribute(data: WriteAttributeRequest): Promise<AttributeResponseStatus> {
         const { nodeId, endpointId, clusterId, attributeId, value } = data;
 
-        const node = this.getNode(nodeId);
-        if (node === undefined) {
-            throw new Error("Node not found");
-        }
-
-        const endpoint = node.getDeviceById(endpointId);
-        if (endpoint === undefined) {
-            throw new Error("Endpoint not found");
-        }
-        const client = endpoint.getClusterClientById(clusterId);
-        if (client === undefined) {
-            throw new Error("Cluster client not found");
-        }
+        const client = this.clusterClientByIdForNode(nodeId, endpointId, clusterId);
 
         logger.info("Writing attribute", attributeId, "with value", value);
         try {
@@ -710,18 +713,8 @@ export class ControllerCommandHandler {
         } = data;
         let { data: commandData } = data;
 
-        const node = this.getNode(nodeId);
-        if (node === undefined) {
-            throw new Error("Node not found");
-        }
-        const endpoint = node.getDeviceById(endpointId);
-        if (endpoint === undefined) {
-            throw new Error("Endpoint not found");
-        }
-        const client = endpoint.getClusterClientById(clusterId);
-        if (client === undefined) {
-            throw new Error("Cluster client not found");
-        }
+        const client = this.clusterClientByIdForNode(nodeId, endpointId, clusterId);
+
         if (!client[commandName] || !client.isCommandSupportedByName(commandName)) {
             throw new Error("Command not existing");
         }
@@ -732,7 +725,7 @@ export class ControllerCommandHandler {
             const cluster = ClusterMap[client.name.toLowerCase()];
             const model = cluster?.commands[commandName.toLowerCase()];
             if (cluster && model) {
-                commandData = convertCommandArgumentToMatter(commandData, model, cluster.model);
+                commandData = convertCommandDataToMatter(commandData, model, cluster.model);
             }
         }
         return (client[commandName] as unknown as SignatureFromCommandSpec<Command<any, any, any>>)(commandData, {
@@ -744,11 +737,7 @@ export class ControllerCommandHandler {
     /** InvokeById minimalistic handler because only used for error testing */
     async handleInvokeById(data: InvokeByIdRequest): Promise<void> {
         const { nodeId, endpointId, clusterId, commandId, data: commandData, timedInteractionTimeoutMs } = data;
-        const node = this.getNode(nodeId);
-        if (node === undefined) {
-            throw new Error("Node not found");
-        }
-        const client = await node.getInteractionClient();
+        const client = await this.interactionClientForNode(nodeId);
         await client.invoke<Command<any, any, any>>({
             endpointId,
             clusterId: clusterId,
@@ -765,11 +754,7 @@ export class ControllerCommandHandler {
     async handleWriteAttributeById(data: WriteAttributeByIdRequest): Promise<void> {
         const { nodeId, endpointId, clusterId, attributeId, value } = data;
 
-        const node = this.getNode(nodeId);
-        if (node === undefined) {
-            throw new Error("Node not found");
-        }
-        const client = await node.getInteractionClient();
+        const client = await this.interactionClientForNode(nodeId);
 
         logger.info("Writing attribute", attributeId, "with value", value);
 
@@ -955,9 +940,6 @@ export class ControllerCommandHandler {
 
     async getNodeIpAddresses(nodeId: NodeId, preferCache = true) {
         const node = this.getNode(nodeId);
-        if (!node) {
-            throw new Error(`Node ${nodeId} not found`);
-        }
         const addresses = new Set<string>();
         const generalDiag = node.getRootClusterClient(GeneralDiagnosticsCluster);
         if (generalDiag) {
@@ -988,9 +970,6 @@ export class ControllerCommandHandler {
      */
     async pingNode(nodeId: NodeId, attempts = 1): Promise<NodePingResult> {
         const node = this.getNode(nodeId);
-        if (!node) {
-            throw new Error(`Node ${nodeId} not found`);
-        }
 
         const result: NodePingResult = {};
 
@@ -1017,10 +996,10 @@ export class ControllerCommandHandler {
 
         // If the node is connected, treat the connection as valid
         if (node.isConnected) {
-            // Find any successful ping or mark connection as reachable
+            // Find any successful ping or mark the connection as reachable
             const anySuccess = Object.values(result).some(v => v);
             if (!anySuccess && ipAddresses.length > 0) {
-                // Node is connected but no pings succeeded - this can happen
+                // Node is connected, but no pings succeeded - this can happen
                 // with Thread devices or certain network configurations
                 logger.info(`Node ${nodeId} is connected but no pings succeeded`);
             }
@@ -1030,8 +1009,8 @@ export class ControllerCommandHandler {
     }
 
     async decommissionNode(nodeId: NodeId) {
-        const node = this.getNode(nodeId);
-        await this.#controller.removeNode(NodeId(BigInt(nodeId)), !!node?.isConnected);
+        const node = this.hasNode(nodeId) ? this.getNode(nodeId) : undefined;
+        await this.#controller.removeNode(nodeId, !!node?.isConnected);
         this.#nodes.delete(nodeId);
         // Clear the attribute cache for the removed node
         this.#attributeCache.delete(nodeId);
@@ -1042,23 +1021,14 @@ export class ControllerCommandHandler {
     async openCommissioningWindow(data: OpenCommissioningWindowRequest): Promise<OpenCommissioningWindowResponse> {
         const { nodeId, timeout } = data;
         const node = this.getNode(nodeId);
-        if (node == undefined) {
-            throw new Error("Node not found");
-        }
         const { manualPairingCode, qrPairingCode } = await node.openEnhancedCommissioningWindow(timeout);
         return { manualCode: manualPairingCode, qrCode: qrPairingCode };
     }
 
     async getFabrics(nodeId: NodeId) {
-        const node = this.getNode(nodeId);
-        if (node === undefined) {
-            throw new Error("Node not found");
-        }
-        const client = node.getRootClusterClient(OperationalCredentials.Cluster);
-        if (client === undefined) {
-            throw new Error("GeneralCommissioning.Cluster not found");
-        }
-        return (await client.getFabricsAttribute()).map(({ fabricId, fabricIndex, vendorId, label }) => ({
+        const client = this.clusterClientForNode(nodeId, EndpointNumber(0), OperationalCredentials.Cluster);
+
+        return (await client.getFabricsAttribute(true, false)).map(({ fabricId, fabricIndex, vendorId, label }) => ({
             fabricId,
             vendorId,
             fabricIndex,
@@ -1067,14 +1037,8 @@ export class ControllerCommandHandler {
     }
 
     removeFabric(nodeId: NodeId, fabricIndex: FabricIndex) {
-        const node = this.getNode(nodeId);
-        if (node === undefined) {
-            throw new Error("Node not found");
-        }
-        const client = node.getRootClusterClient(OperationalCredentials.Cluster);
-        if (client === undefined) {
-            throw new Error("GeneralCommissioning.Cluster not found");
-        }
+        const client = this.clusterClientForNode(nodeId, EndpointNumber(0), OperationalCredentials.Cluster);
+
         return client.removeFabric({ fabricIndex });
     }
 
@@ -1083,18 +1047,7 @@ export class ControllerCommandHandler {
      * Writes to the ACL attribute on the AccessControl cluster (endpoint 0).
      */
     async setAclEntry(nodeId: NodeId, entries: AccessControlEntry[]): Promise<AttributeWriteResult[] | null> {
-        const node = this.getNode(nodeId);
-        if (node === undefined) {
-            throw new Error("Node not found");
-        }
-
-        const client = node.getRootClusterClient(AccessControl.Cluster);
-        if (client === undefined) {
-            throw new Error("AccessControl cluster not found");
-        }
-
-        // Get the fabric index for this controller's fabric on the target node
-        const fabricIndex = await this.#getNodeFabricIndex(node);
+        const client = this.clusterClientForNode(nodeId, EndpointNumber(0), AccessControl.Cluster);
 
         // Convert from WebSocket format (snake_case) to Matter.js format (camelCase)
         const aclEntries: AccessControl.AccessControlEntry[] = entries.map(entry => ({
@@ -1107,7 +1060,7 @@ export class ControllerCommandHandler {
                     endpoint: t.endpoint !== null ? EndpointNumber(t.endpoint) : null,
                     deviceType: t.device_type !== null ? DeviceTypeId(t.device_type) : null,
                 })) ?? null,
-            fabricIndex,
+            fabricIndex: FabricIndex.OMIT_FABRIC,
         }));
 
         logger.info("Setting ACL entries", aclEntries);
@@ -1140,23 +1093,6 @@ export class ControllerCommandHandler {
     }
 
     /**
-     * Get the fabric index for the current controller's fabric on a node.
-     */
-    async #getNodeFabricIndex(node: PairedNode): Promise<FabricIndex> {
-        const opCredClient = node.getRootClusterClient(OperationalCredentials.Cluster);
-        if (opCredClient === undefined) {
-            throw new Error("OperationalCredentials cluster not found");
-        }
-        const fabrics = await opCredClient.getFabricsAttribute();
-        const controllerFabricId = this.#controller.fabric.fabricId;
-        const fabric = fabrics.find(f => f.fabricId === controllerFabricId);
-        if (fabric === undefined) {
-            throw new Error("Controller fabric not found on node");
-        }
-        return fabric.fabricIndex;
-    }
-
-    /**
      * Set bindings on a specific endpoint of a node.
      * Writes to the Binding attribute on the Binding cluster.
      */
@@ -1165,31 +1101,15 @@ export class ControllerCommandHandler {
         endpointId: EndpointNumber,
         bindings: BindingTarget[],
     ): Promise<AttributeWriteResult[] | null> {
-        const node = this.getNode(nodeId);
-        if (node === undefined) {
-            throw new Error("Node not found");
-        }
-
-        const endpoint = node.getDeviceById(endpointId);
-        if (endpoint === undefined) {
-            throw new Error("Endpoint not found");
-        }
-
-        const client = endpoint.getClusterClientById(Binding.Cluster.id);
-        if (client === undefined) {
-            throw new Error("Binding cluster not found on endpoint");
-        }
-
-        // Get the fabric index for this controller's fabric on the target node
-        const fabricIndex = await this.#getNodeFabricIndex(node);
+        const client = this.clusterClientForNode(nodeId, endpointId, Binding.Cluster);
 
         // Convert from WebSocket format to Matter.js format
         const bindingEntries: Binding.Target[] = bindings.map(binding => ({
-            node: binding.node !== null ? NodeId(BigInt(binding.node)) : undefined,
+            node: binding.node !== null ? NodeId(binding.node) : undefined,
             group: binding.group !== null ? GroupId(binding.group) : undefined,
             endpoint: binding.endpoint !== null ? EndpointNumber(binding.endpoint) : undefined,
             cluster: binding.cluster !== null ? ClusterId(binding.cluster) : undefined,
-            fabricIndex,
+            fabricIndex: FabricIndex.OMIT_FABRIC,
         }));
 
         logger.info("Setting bindings on endpoint", endpointId, bindingEntries);
@@ -1237,9 +1157,6 @@ export class ControllerCommandHandler {
 
         // No cached update, query the OTA provider
         const node = this.getNode(nodeId);
-        if (node === undefined) {
-            throw new Error("Node not found");
-        }
 
         try {
             const otaProvider = this.#controller.otaProvider;
@@ -1247,10 +1164,6 @@ export class ControllerCommandHandler {
                 logger.info("OTA provider not available");
                 return null;
             }
-
-            // Get fabric index for the peer address
-            const fabricIndex = await this.#getNodeFabricIndex(node);
-            const peerAddress = PeerAddress({ nodeId, fabricIndex });
 
             // Query OTA provider for updates using dynamic behavior access
             const updatesAvailable = await otaProvider.act(agent =>
@@ -1261,6 +1174,7 @@ export class ControllerCommandHandler {
             );
 
             // Find update for this specific node
+            const peerAddress = this.#controller.fabric.addressOf(nodeId);
             const nodeUpdate = updatesAvailable.find(({ peerAddress: updateAddress }) =>
                 PeerAddress.is(peerAddress, updateAddress),
             );
@@ -1287,9 +1201,8 @@ export class ControllerCommandHandler {
         if (!this.#otaEnabled) {
             throw new Error("OTA is disabled.");
         }
-        const node = this.getNode(nodeId);
-        if (node === undefined) {
-            throw new Error("Node not found");
+        if (!this.hasNode(nodeId)) {
+            throw new Error(`Node ${nodeId} not found`);
         }
 
         try {
@@ -1312,17 +1225,18 @@ export class ControllerCommandHandler {
                 }
             }
 
-            // Get fabric index and basic info for the update
-            const fabricIndex = await this.#getNodeFabricIndex(node);
-            const peerAddress = PeerAddress({ nodeId, fabricIndex });
-
             logger.info(`Starting update for node ${nodeId} to version ${softwareVersion}`);
 
             // Trigger the update using forceUpdate via dynamic behavior access
             await otaProvider.act(agent =>
                 agent
                     .get(SoftwareUpdateManager)
-                    .forceUpdate(peerAddress, updateInfo.vendorId, updateInfo.productId, softwareVersion),
+                    .forceUpdate(
+                        this.#controller.fabric.addressOf(nodeId),
+                        updateInfo.vendorId,
+                        updateInfo.productId,
+                        softwareVersion,
+                    ),
             );
 
             // Return the update info
