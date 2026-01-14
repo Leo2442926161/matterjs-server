@@ -81,6 +81,24 @@ Common options:
 
 For all available options, see the [CLI documentation](cli.md).
 
+### Environment Variables
+
+| Variable    | Description                | Default | Values                                           |
+|-------------|----------------------------|---------|--------------------------------------------------|
+| `LOG_LEVEL` | Server logging verbosity   | `info`  | `debug`, `info`, `notice`, `warn`, `error`, `fatal` |
+
+Example with environment variable:
+
+```bash
+docker run -d \
+  --name matterjs-server \
+  --restart=unless-stopped \
+  -v $(pwd)/data:/data \
+  --network=host \
+  -e LOG_LEVEL=debug \
+  ghcr.io/matter-js/matterjs-server:stable
+```
+
 ## Building the Docker Image Locally
 
 If you want to build the Docker image yourself:

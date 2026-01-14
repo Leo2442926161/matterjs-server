@@ -45,6 +45,13 @@ RUN \
     # Clean temp directories
     && rm -rf /tmp/* /var/tmp/* /root/.npm /root/.cache
 
+# Copy entrypoint script
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Log level (debug, info, notice, warn, error, fatal)
+ENV LOG_LEVEL=info
+
 # Data volume for persistent storage
 VOLUME ["/data"]
 
@@ -56,6 +63,5 @@ HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:5580/ || exit 1
 
 # Run the matter server with data stored in /data
-# --enable-source-maps provides better stack traces in error logs
-ENTRYPOINT ["node", "--enable-source-maps", "node_modules/matter-server/dist/esm/MatterServer.js"]
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["--storage-path", "/data"]
