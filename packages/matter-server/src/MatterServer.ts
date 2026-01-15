@@ -30,6 +30,7 @@ import { WebServer } from "./server/WebServer.js";
 // Register the custom clusters
 import "@matter-server/custom-clusters";
 import { initializeOta } from "./ota.js";
+import { MATTER_SERVER_VERSION } from "./version.js";
 
 /**
  * Creates a file-based logger that appends to the given path.
@@ -177,7 +178,7 @@ async function start() {
         logger.info("Legacy data event handlers configured for node commissioning/decommissioning");
     }
 
-    const handlers: WebServerHandler[] = [new WebSocketControllerHandler(controller, config)];
+    const handlers: WebServerHandler[] = [new WebSocketControllerHandler(controller, config, MATTER_SERVER_VERSION)];
     if (!cliOptions.disableDashboard) {
         handlers.push(new StaticFileHandler());
     } else {

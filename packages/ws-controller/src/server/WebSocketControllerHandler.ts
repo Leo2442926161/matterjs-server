@@ -51,6 +51,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
     #commandHandler: ControllerCommandHandler;
     #testNodeHandler: TestNodeCommandHandler;
     #config: ConfigStorage;
+    #serverVersion: string;
     #wss?: WebSocketServer;
     #closed = false;
     /** Circular buffer for recent node events (max 25) */
@@ -58,11 +59,12 @@ export class WebSocketControllerHandler implements WebServerHandler {
     /** Track when each node was last interviewed (connected) - keyed by nodeId */
     #lastInterviewDates = new Map<NodeId, Date>();
 
-    constructor(controller: MatterController, config: ConfigStorage) {
+    constructor(controller: MatterController, config: ConfigStorage, serverVersion: string) {
         this.#controller = controller;
         this.#commandHandler = controller.commandHandler;
         this.#testNodeHandler = new TestNodeCommandHandler();
         this.#config = config;
+        this.#serverVersion = serverVersion;
     }
 
     /**
@@ -433,7 +435,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
             compressed_fabric_id,
             schema_version: SCHEMA_VERSION,
             min_supported_schema_version: SCHEMA_VERSION,
-            sdk_version: `matter.js/${MATTER_VERSION}`,
+            sdk_version: `matter-server/${this.#serverVersion} (matter.js/${MATTER_VERSION})`,
             wifi_credentials_set: !!(this.#config.wifiSsid && this.#config.wifiCredentials),
             thread_credentials_set: !!this.#config.threadDataset,
             bluetooth_enabled: this.#commandHandler.bleEnabled,

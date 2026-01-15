@@ -103,6 +103,7 @@ describe("Integration Test", function () {
             expect(info).to.have.property("compressed_fabric_id");
             expect(info.schema_version).to.equal(11);
             expect(info.min_supported_schema_version).to.equal(11);
+            expect(info.sdk_version).to.be.a("string").that.includes("matter-server");
             expect(info.sdk_version).to.be.a("string").that.includes("matter.js");
             expect(info.wifi_credentials_set).to.be.a("boolean");
             expect(info.thread_credentials_set).to.be.a("boolean");
