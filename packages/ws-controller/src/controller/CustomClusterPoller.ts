@@ -10,7 +10,7 @@
  * a custom cluster without standard Matter subscription support.
  */
 
-import { CancelablePromise, Logger, Millis, NodeId, Seconds, Time, Timer } from "@matter/main";
+import { CancelablePromise, Duration, Logger, Millis, NodeId, Time, Timer } from "@matter/main";
 import { AttributesData } from "../types/CommandHandler.js";
 
 const logger = Logger.get("CustomClusterPoller");
@@ -122,7 +122,6 @@ export class CustomClusterPoller {
         this.#attributeReader = attributeReader;
         const delay = Millis(Math.random() * MAX_INITIAL_DELAY_MS);
         this.#pollerTimer = Time.getTimer("eve-poller", delay, () => this.#pollAllNodes());
-        logger.info(`Scheduling initial custom attribute poll in ${Seconds.of(delay)}s`);
     }
 
     /**
@@ -154,20 +153,9 @@ export class CustomClusterPoller {
         if (this.#polledAttributes.delete(nodeId)) {
             logger.info(`Unregistered node ${nodeId} from custom attribute polling`);
         }
-    }
-
-    /**
-     * Check if a node has any attributes being polled.
-     */
-    hasPolledAttributes(nodeId: NodeId): boolean {
-        return this.#polledAttributes.has(nodeId);
-    }
-
-    /**
-     * Get the set of polled attributes for a node.
-     */
-    getPolledAttributes(nodeId: NodeId): Set<AttributePath> | undefined {
-        return this.#polledAttributes.get(nodeId);
+        if (this.#polledAttributes.size === 0) {
+            this.#pollerTimer.stop();
+        }
     }
 
     /**
@@ -199,6 +187,7 @@ export class CustomClusterPoller {
 
         // Set the new interval
         this.#pollerTimer.start();
+        logger.info(`Scheduling custom attribute poll in ${Duration.format(this.#pollerTimer.interval)}`);
     }
 
     /**
@@ -221,11 +210,17 @@ export class CustomClusterPoller {
             const entries = Array.from(this.#polledAttributes.entries());
             for (let i = 0; i < entries.length; i++) {
                 const [nodeId, attributePaths] = entries[i];
+                if (!this.#polledAttributes.has(nodeId)) {
+                    // Node was removed, so skip it
+                    continue;
+                }
                 await this.#pollNode(nodeId, attributePaths);
                 // Small delay between nodes to avoid overwhelming the network
                 // Only add this delay if there are more nodes remaining to be polled
                 if (i < entries.length - 1) {
-                    this.#currentDelayPromise = Time.sleep("sleep", Millis(1_000));
+                    this.#currentDelayPromise = Time.sleep("sleep", Millis(1_000)).finally(() => {
+                        this.#currentDelayPromise = undefined;
+                    });
                     await this.#currentDelayPromise;
                 }
             }
