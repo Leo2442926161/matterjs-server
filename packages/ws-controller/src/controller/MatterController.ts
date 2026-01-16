@@ -81,6 +81,19 @@ export class MatterController {
                     commissionedDates.set(nodeIdStr, Timestamp(new Date(commissionedAt).getTime()));
                 }
             }
+
+            // Check if nextNodeId needs to be updated based on legacy data
+            const lastNodeId = legacyData.nodeData?.last_node_id;
+            if (typeof lastNodeId === "number") {
+                if (config.nextNodeId <= lastNodeId) {
+                    const newNextNodeId = lastNodeId + 10;
+                    logger.info(
+                        `Updating nextNodeId from ${config.nextNodeId} to ${newNextNodeId} (legacy last_node_id: ${lastNodeId})`,
+                    );
+                    await config.set({ nextNodeId: newNextNodeId });
+                }
+            }
+
             await baseStorage.close();
         }
 
