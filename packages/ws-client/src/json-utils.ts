@@ -52,18 +52,80 @@ export function toBigIntAwareJson(value: unknown, spaces?: number): string {
  * Parse JSON with BigInt support for large numbers that exceed JavaScript precision.
  * Numbers with 15+ digits that exceed MAX_SAFE_INTEGER are converted to BigInt.
  * Use this for incoming WebSocket messages.
+ *
+ * This function carefully avoids modifying numbers that appear inside string values.
  */
 export function parseBigIntAwareJson(json: string): unknown {
     // Pre-process: Replace large numbers (15+ digits) with marked string placeholders
     // This must happen before JSON.parse to preserve precision
-    // Match numbers after colon (object values) or after [ or , (array elements)
-    const processed = json.replace(/([:,[])\s*(\d{15,})(?=[,}\]\s])/g, (match, prefix, number) => {
-        const num = BigInt(number);
-        if (num > Number.MAX_SAFE_INTEGER) {
-            return `${prefix}"${BIGINT_MARKER}${number}"`;
+    // We need to track whether we're inside a string to avoid modifying string contents
+    const result: string[] = [];
+    let i = 0;
+    let inString = false;
+
+    while (i < json.length) {
+        const char = json[i];
+
+        if (inString) {
+            // Inside a string - copy characters as-is until we find the closing quote
+            if (char === "\\") {
+                // Escape sequence - copy both the backslash and the next character
+                result.push(char);
+                i++;
+                if (i < json.length) {
+                    result.push(json[i]);
+                    i++;
+                }
+            } else if (char === '"') {
+                // End of string
+                result.push(char);
+                inString = false;
+                i++;
+            } else {
+                result.push(char);
+                i++;
+            }
+        } else {
+            // Outside a string
+            if (char === '"') {
+                // Start of a string
+                result.push(char);
+                inString = true;
+                i++;
+            } else if (char >= "0" && char <= "9") {
+                // Potential number - extract and check
+                // Check if previous character was a minus sign (for negative numbers)
+                const hasMinus = result.length > 0 && result[result.length - 1] === "-";
+                if (hasMinus) {
+                    result.pop(); // Remove the minus sign, we'll include it in the number
+                }
+
+                const start = i;
+                while (i < json.length && json[i] >= "0" && json[i] <= "9") {
+                    i++;
+                }
+                const digitsStr = json.slice(start, i);
+                const numberStr = hasMinus ? `-${digitsStr}` : digitsStr;
+
+                // Only convert if it's 15+ digits and exceeds safe integer range
+                if (digitsStr.length >= 15) {
+                    const num = BigInt(numberStr);
+                    if (num > Number.MAX_SAFE_INTEGER || num < Number.MIN_SAFE_INTEGER) {
+                        result.push(`"${BIGINT_MARKER}${numberStr}"`);
+                    } else {
+                        result.push(numberStr);
+                    }
+                } else {
+                    result.push(numberStr);
+                }
+            } else {
+                result.push(char);
+                i++;
+            }
         }
-        return match;
-    });
+    }
+
+    const processed = result.join("");
 
     // Parse with reviver to convert marked strings back to BigInt
     return JSON.parse(processed, (_key, value) => {
