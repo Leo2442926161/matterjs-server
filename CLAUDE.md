@@ -75,3 +75,36 @@ Dashboard has additional `npm run generate` step for cluster descriptions.
 ## Node.js Requirements
 
 Engine requirement: `>=20.19.0 <22.0.0 || >=22.13.0`
+
+## Dashboard Development
+
+### Technology Stack
+- **Lit 3.x**: Web components framework with TypeScript decorators
+- **Material Web 2.4.x**: Material Design 3 components (`md-*` elements)
+- **@mdi/js**: Material Design Icons as SVG paths
+- **CSS Variables**: All colors use CSS custom properties for theming
+
+### Styling Patterns
+- All components use inline `static override styles = css\`...\`` (Lit pattern)
+- Colors must use CSS variables from `public/index.html`, not hardcoded values
+- Key variables: `--md-sys-color-primary`, `--md-sys-color-surface`, `--md-sys-color-on-surface`, `--md-sys-color-on-surface-variant`
+- Dark mode: Variables overridden in `html.dark-theme body` selector
+
+### Theme System
+- `src/util/theme-service.ts`: Singleton managing theme state
+- Supports: `light`, `dark`, `system` (OS auto-detect)
+- Persisted in localStorage (`matterTheme` key)
+- Query parameter override: `?theme=dark|light|system`
+
+### Key Dashboard Files
+- `public/index.html`: CSS variables for light/dark themes
+- `src/util/theme-service.ts`: Theme management singleton
+- `src/pages/components/header.ts`: Header bar with theme toggle
+- `src/pages/matter-dashboard-app.ts`: Main app with connection states
+- `src/components/ha-svg-icon.ts`: Custom SVG icon component
+
+### Common Pitfalls
+- Don't use hardcoded colors like `#673ab7` or `cornsilk` - use CSS variables
+- Material Web components need proper `--md-sys-color-*` variables to render correctly in dark mode
+- When adding status/error pages, include the header component for consistent UX
+- The dashboard is served by the Matter Server, so `location.reload()` fails when server is offline - use WebSocket reconnect instead
