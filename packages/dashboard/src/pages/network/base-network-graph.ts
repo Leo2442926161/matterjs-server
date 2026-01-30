@@ -74,7 +74,7 @@ export abstract class BaseNetworkGraph extends LitElement {
             this._tryAttachContainer();
         }
 
-        if (changedProperties.has("nodes") || changedProperties.has("_selectedNodeId")) {
+        if (changedProperties.has("nodes")) {
             this._debouncedUpdateGraph();
         }
     }

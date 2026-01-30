@@ -87,12 +87,13 @@ export interface ThreadRoute {
 
 /**
  * Categorized devices by network type.
+ * Node IDs are stored as strings to avoid BigInt precision loss.
  */
 export interface CategorizedDevices {
-    thread: number[];
-    wifi: number[];
-    ethernet: number[];
-    unknown: number[];
+    thread: string[];
+    wifi: string[];
+    ethernet: string[];
+    unknown: string[];
 }
 
 /**
@@ -116,8 +117,8 @@ export interface UnknownThreadDevice {
     extAddressHex: string;
     /** Extended address as BigInt */
     extAddress: bigint;
-    /** Node IDs that see this device as a neighbor */
-    seenBy: number[];
+    /** Node IDs that see this device as a neighbor (as strings to avoid BigInt precision loss) */
+    seenBy: string[];
     /** Whether this device appears to be a router */
     isRouter: boolean;
     /** Best signal strength seen */

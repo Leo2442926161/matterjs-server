@@ -38,8 +38,9 @@ class MatterNetworkView extends LitElement {
     @property()
     public networkType: "thread" | "wifi" = "thread";
 
-    @property({ type: Number })
-    public initialSelectedNodeId: number | null = null;
+    /** Initial selected node ID from URL (string to avoid BigInt precision loss) */
+    @property()
+    public initialSelectedNodeId: string | null = null;
 
     @property({ type: Boolean })
     public hasThreadDevices?: boolean;
@@ -88,7 +89,7 @@ class MatterNetworkView extends LitElement {
     /**
      * Tries to select a node in the graph, retrying until the graph is ready.
      */
-    private _selectNodeWhenReady(nodeId: number, retries: number = 10): void {
+    private _selectNodeWhenReady(nodeId: string | number, retries: number = 10): void {
         const graph = this.networkType === "thread" ? this._threadGraph : this._wifiGraph;
 
         if (graph?.isReady()) {

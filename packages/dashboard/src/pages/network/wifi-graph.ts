@@ -26,7 +26,8 @@ declare global {
 /** WiFi access point (router) node info */
 interface WiFiAccessPoint {
     bssid: string;
-    connectedNodes: number[];
+    /** Connected node IDs as strings to avoid BigInt precision loss */
+    connectedNodes: string[];
 }
 
 @customElement("wifi-graph")
@@ -35,7 +36,7 @@ export class WiFiGraph extends BaseNetworkGraph {
     private _accessPoints: Map<string, WiFiAccessPoint> = new Map();
 
     /** Get access points map for use by details panel */
-    public get wifiAccessPointsMap(): Map<string, { bssid: string; connectedNodes: number[] }> {
+    public get wifiAccessPointsMap(): Map<string, { bssid: string; connectedNodes: string[] }> {
         return this._accessPoints;
     }
 
@@ -80,10 +81,11 @@ export class WiFiGraph extends BaseNetworkGraph {
         }
 
         // Build access points map from BSSID, keyed by apId
+        // wifiNodeIds are already strings from categorizeDevices
         this._accessPoints.clear();
 
         for (const nodeId of wifiNodeIds) {
-            const node = this.nodes[nodeId.toString()];
+            const node = this.nodes[nodeId];
             if (!node) continue;
 
             const wifiDiag = getWiFiDiagnostics(node);
@@ -119,12 +121,13 @@ export class WiFiGraph extends BaseNetworkGraph {
         }
 
         // Add device nodes and edges
+        // nodeId is already a string from categorizeDevices
         let edgeIndex = 0;
         for (const nodeId of wifiNodeIds) {
-            const node = this.nodes[nodeId.toString()];
+            const node = this.nodes[nodeId];
             if (!node) continue;
 
-            const isSelected = String(nodeId) === String(this._selectedNodeId);
+            const isSelected = nodeId === String(this._selectedNodeId);
             const isOffline = node.available === false;
             const networkType = getNetworkType(node);
             const wifiDiag = getWiFiDiagnostics(node);

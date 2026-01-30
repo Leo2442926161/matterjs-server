@@ -32,13 +32,13 @@ export class ThreadGraph extends BaseNetworkGraph {
     /** Cached map of unknown devices (rebuilt in _updateGraph) */
     private _unknownDevicesMapCache: Map<
         string,
-        { extAddressHex: string; isRouter: boolean; seenBy: number[]; bestRssi: number | null }
+        { extAddressHex: string; isRouter: boolean; seenBy: string[]; bestRssi: number | null }
     > = new Map();
 
     /** Get unknown devices as a map for use by details panel */
     public get unknownDevicesMap(): Map<
         string,
-        { extAddressHex: string; isRouter: boolean; seenBy: number[]; bestRssi: number | null }
+        { extAddressHex: string; isRouter: boolean; seenBy: string[]; bestRssi: number | null }
     > {
         return this._unknownDevicesMapCache;
     }
@@ -81,11 +81,11 @@ export class ThreadGraph extends BaseNetworkGraph {
         const connections = buildThreadConnections(this.nodes, extAddrMap, this._unknownDevices);
 
         // Create node data for vis.js - known Thread devices
+        // Use string IDs to avoid precision loss for large bigint node IDs
         const graphNodes: NetworkGraphNode[] = threadNodes.map(node => {
-            // Use number for small IDs, but compare as string for safety with large IDs
-            const nodeId = typeof node.node_id === "bigint" ? Number(node.node_id) : node.node_id;
+            const nodeId = String(node.node_id);
             const threadRole = getThreadRole(node);
-            const isSelected = String(nodeId) === String(this._selectedNodeId);
+            const isSelected = nodeId === String(this._selectedNodeId);
             const isOffline = node.available === false;
 
             return {

@@ -46,11 +46,11 @@ export class NetworkDetails extends LitElement {
     @property({ type: Object })
     public unknownDevices: Map<
         string,
-        { extAddressHex: string; isRouter: boolean; seenBy: number[]; bestRssi: number | null }
+        { extAddressHex: string; isRouter: boolean; seenBy: string[]; bestRssi: number | null }
     > = new Map();
 
     @property({ type: Object })
-    public wifiAccessPoints: Map<string, { bssid: string; connectedNodes: number[] }> = new Map();
+    public wifiAccessPoints: Map<string, { bssid: string; connectedNodes: string[] }> = new Map();
 
     private _handleClose(): void {
         this.dispatchEvent(
@@ -69,6 +69,14 @@ export class NetworkDetails extends LitElement {
                 composed: true,
             }),
         );
+    }
+
+    /** Handle keyboard interaction for clickable elements (Enter/Space activates) */
+    private _handleKeyDown(event: KeyboardEvent, nodeId: number | string): void {
+        if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            this._handleSelectNode(nodeId);
+        }
     }
 
     private _formatExtAddress(extAddr: bigint | string | undefined): string {
@@ -155,7 +163,8 @@ export class NetworkDetails extends LitElement {
         const extAddrMap = buildExtAddrMap(this.nodes);
 
         // Get all connections (bidirectional) - this matches what the graph shows
-        const nodeId = typeof node.node_id === "bigint" ? Number(node.node_id) : node.node_id;
+        // Use string to avoid BigInt precision loss
+        const nodeId = String(node.node_id);
         const connections = getNodeConnections(nodeId, this.nodes, extAddrMap);
 
         return html`
@@ -193,7 +202,10 @@ export class NetworkDetails extends LitElement {
                                   return html`
                                       <div
                                           class="neighbor-item clickable"
+                                          role="button"
+                                          tabindex="0"
                                           @click=${() => this._handleSelectNode(conn.connectedNodeId)}
+                                          @keydown=${(e: KeyboardEvent) => this._handleKeyDown(e, conn.connectedNodeId)}
                                       >
                                           <ha-svg-icon
                                               .path=${this._getSignalIconFromColor(conn.signalColor)}
@@ -337,7 +349,10 @@ export class NetworkDetails extends LitElement {
                                   return html`
                                       <div
                                           class="neighbor-item clickable"
+                                          role="button"
+                                          tabindex="0"
                                           @click=${() => this._handleSelectNode(nodeId)}
+                                          @keydown=${(e: KeyboardEvent) => this._handleKeyDown(e, nodeId)}
                                       >
                                           ${neighborEntry
                                               ? html`
@@ -409,7 +424,10 @@ export class NetworkDetails extends LitElement {
                                   return html`
                                       <div
                                           class="connected-node-item clickable"
+                                          role="button"
+                                          tabindex="0"
                                           @click=${() => this._handleSelectNode(nodeId)}
+                                          @keydown=${(e: KeyboardEvent) => this._handleKeyDown(e, nodeId)}
                                       >
                                           <div class="node-name">Node ${nodeId}: ${getDeviceName(node)}</div>
                                           ${wifiDiag.rssi !== null

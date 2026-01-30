@@ -115,6 +115,7 @@ export function getNetworkType(node: MatterNode): NetworkType {
 
 /**
  * Categorizes nodes by their network type.
+ * Node IDs are stored as strings to avoid BigInt precision loss.
  */
 export function categorizeDevices(nodes: Record<string, MatterNode>): CategorizedDevices {
     const result: CategorizedDevices = {
@@ -125,7 +126,7 @@ export function categorizeDevices(nodes: Record<string, MatterNode>): Categorize
     };
 
     for (const node of Object.values(nodes)) {
-        const nodeId = typeof node.node_id === "bigint" ? Number(node.node_id) : node.node_id;
+        const nodeId = String(node.node_id);
         const networkType = getNetworkType(node);
         result[networkType].push(nodeId);
     }
@@ -311,12 +312,13 @@ export function getThreadRloc16(node: MatterNode): number | undefined {
 /**
  * Builds a map of extended addresses (BigInt) to node IDs for Thread devices.
  * Uses General Diagnostics NetworkInterfaces (0/51/0) for the hardware address.
+ * Node IDs are stored as strings to avoid BigInt precision loss.
  */
-export function buildExtAddrMap(nodes: Record<string, MatterNode>): Map<bigint, number> {
-    const extAddrMap = new Map<bigint, number>();
+export function buildExtAddrMap(nodes: Record<string, MatterNode>): Map<bigint, string> {
+    const extAddrMap = new Map<bigint, string>();
 
     for (const node of Object.values(nodes)) {
-        const nodeId = typeof node.node_id === "bigint" ? Number(node.node_id) : node.node_id;
+        const nodeId = String(node.node_id);
         const extAddr = getThreadExtendedAddress(node);
 
         if (extAddr !== undefined) {
@@ -330,12 +332,13 @@ export function buildExtAddrMap(nodes: Record<string, MatterNode>): Map<bigint, 
 /**
  * Builds a map of RLOC16 (short addresses) to node IDs for Thread devices.
  * Used as fallback when ExtAddress is not available.
+ * Node IDs are stored as strings to avoid BigInt precision loss.
  */
-export function buildRloc16Map(nodes: Record<string, MatterNode>): Map<number, number> {
-    const rloc16Map = new Map<number, number>();
+export function buildRloc16Map(nodes: Record<string, MatterNode>): Map<number, string> {
+    const rloc16Map = new Map<number, string>();
 
     for (const node of Object.values(nodes)) {
-        const nodeId = typeof node.node_id === "bigint" ? Number(node.node_id) : node.node_id;
+        const nodeId = String(node.node_id);
         const rloc16 = getThreadRloc16(node);
 
         if (rloc16 !== undefined) {
@@ -353,12 +356,12 @@ export function buildRloc16Map(nodes: Record<string, MatterNode>): Map<number, n
  */
 export function findUnknownDevices(
     nodes: Record<string, MatterNode>,
-    extAddrMap: Map<bigint, number>,
+    extAddrMap: Map<bigint, string>,
 ): UnknownThreadDevice[] {
     const unknownMap = new Map<string, UnknownThreadDevice>();
 
     for (const node of Object.values(nodes)) {
-        const nodeId = typeof node.node_id === "bigint" ? Number(node.node_id) : node.node_id;
+        const nodeId = String(node.node_id);
         const neighbors = parseNeighborTable(node);
 
         for (const neighbor of neighbors) {
@@ -586,7 +589,7 @@ export function getWiFiVersionName(version: number | null): string {
  */
 export function buildThreadConnections(
     nodes: Record<string, MatterNode>,
-    extAddrMap: Map<bigint, number>,
+    extAddrMap: Map<bigint, string>,
     unknownDevices: UnknownThreadDevice[],
 ): ThreadConnection[] {
     const connections: ThreadConnection[] = [];
@@ -599,12 +602,12 @@ export function buildThreadConnections(
     }
 
     for (const node of Object.values(nodes)) {
-        const fromNodeId = typeof node.node_id === "bigint" ? Number(node.node_id) : node.node_id;
+        const fromNodeId = String(node.node_id);
         const neighbors = parseNeighborTable(node);
 
         for (const neighbor of neighbors) {
             // Try to find in known devices first
-            let toNodeId: number | string | undefined = extAddrMap.get(neighbor.extAddress);
+            let toNodeId: string | undefined = extAddrMap.get(neighbor.extAddress);
 
             // If not found, check unknown devices
             if (toNodeId === undefined) {
@@ -673,16 +676,18 @@ export interface NodeConnection {
  *
  * Returns a deduplicated list - if both directions exist, only the outgoing one is included
  * (since that has signal data from THIS node's perspective).
+ *
+ * @param nodeId - Node ID as string to avoid BigInt precision loss
  */
 export function getNodeConnections(
-    nodeId: number,
+    nodeId: string,
     nodes: Record<string, MatterNode>,
-    extAddrMap: Map<bigint, number>,
+    extAddrMap: Map<bigint, string>,
 ): NodeConnection[] {
     const connections: NodeConnection[] = [];
-    const seenConnectedIds = new Set<number | string>();
+    const seenConnectedIds = new Set<string>();
 
-    const node = nodes[nodeId.toString()];
+    const node = nodes[nodeId];
     if (!node) return connections;
 
     // Get this node's extended address for reverse lookups (from General Diagnostics, not Thread Diagnostics)
@@ -692,7 +697,7 @@ export function getNodeConnections(
     const neighbors = parseNeighborTable(node);
     for (const neighbor of neighbors) {
         const connectedNodeId = extAddrMap.get(neighbor.extAddress);
-        const connectedNode = connectedNodeId ? nodes[connectedNodeId.toString()] : undefined;
+        const connectedNode = connectedNodeId ? nodes[connectedNodeId] : undefined;
         const isUnknown = connectedNodeId === undefined;
         const displayId = isUnknown
             ? `unknown_${neighbor.extAddress.toString(16).toUpperCase().padStart(16, "0")}`
@@ -715,7 +720,7 @@ export function getNodeConnections(
     // 2. Find nodes that report THIS node as their neighbor (incoming connections)
     if (thisExtAddr !== undefined) {
         for (const otherNode of Object.values(nodes)) {
-            const otherNodeId = typeof otherNode.node_id === "bigint" ? Number(otherNode.node_id) : otherNode.node_id;
+            const otherNodeId = String(otherNode.node_id);
             if (otherNodeId === nodeId) continue; // Skip self
 
             // Check if already connected via outgoing

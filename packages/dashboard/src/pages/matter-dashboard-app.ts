@@ -37,7 +37,8 @@ class MatterDashboardApp extends LitElement {
 
     @state() private _activeView: ActiveView = "nodes";
 
-    @state() private _initialSelectedNodeId: number | null = null;
+    /** Initial selected node ID from URL (string to avoid BigInt precision loss) */
+    @state() private _initialSelectedNodeId: string | null = null;
 
     public client!: MatterClient;
 
@@ -75,12 +76,9 @@ class MatterDashboardApp extends LitElement {
                     return;
                 }
                 this._activeView = "thread";
-                // Check for node ID: #thread/123
+                // Check for node ID: #thread/123 - keep as string to avoid BigInt precision loss
                 if (pathParts.length > 1 && pathParts[1]) {
-                    const nodeId = parseInt(pathParts[1], 10);
-                    if (!isNaN(nodeId)) {
-                        this._initialSelectedNodeId = nodeId;
-                    }
+                    this._initialSelectedNodeId = pathParts[1];
                 }
             } else if (pathParts[0] === "wifi") {
                 // Only redirect if nodes have been loaded (avoid redirecting on initial load before data arrives)
@@ -89,12 +87,9 @@ class MatterDashboardApp extends LitElement {
                     return;
                 }
                 this._activeView = "wifi";
-                // Check for node ID: #wifi/123
+                // Check for node ID: #wifi/123 - keep as string to avoid BigInt precision loss
                 if (pathParts.length > 1 && pathParts[1]) {
-                    const nodeId = parseInt(pathParts[1], 10);
-                    if (!isNaN(nodeId)) {
-                        this._initialSelectedNodeId = nodeId;
-                    }
+                    this._initialSelectedNodeId = pathParts[1];
                 }
             } else if (hash === "nodes" || hash === "" || pathParts[0] === "node") {
                 this._activeView = "nodes";
