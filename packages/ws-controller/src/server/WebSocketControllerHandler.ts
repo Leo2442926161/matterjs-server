@@ -6,7 +6,7 @@
 
 import { camelize, ClusterId, FabricIndex, Logger, LogLevel, Millis, NodeId, ObserverGroup } from "@matter/main";
 import { ControllerCommissioningFlowOptions } from "@matter/main/protocol";
-import { EndpointNumber, getClusterById, QrPairingCodeCodec } from "@matter/main/types";
+import { EndpointNumber, QrPairingCodeCodec } from "@matter/main/types";
 import { NodeStates } from "@project-chip/matter.js/device";
 import { WebSocketServer } from "ws";
 import { ControllerCommandHandler } from "../controller/ControllerCommandHandler.js";
@@ -138,19 +138,19 @@ export class WebSocketControllerHandler implements WebServerHandler {
 
                 switch (eventName) {
                     case "node_added":
-                    case "node_updated":
-                        this.#collectNodeDetails(nodeId).then(
-                            nodeDetails => {
-                                logger.debug(`[${connId}] Sending ${eventName} event for Node ${formatNodeId(nodeId)}`);
-                                ws.send(toBigIntAwareJson({ event: eventName, data: nodeDetails }));
-                            },
-                            err =>
-                                logger.error(
-                                    `[${connId}] Failed to collect node details for Node ${formatNodeId(nodeId)}`,
-                                    err,
-                                ),
-                        );
+                    case "node_updated": {
+                        try {
+                            const nodeDetails = this.#collectNodeDetails(nodeId);
+                            logger.debug(`[${connId}] Sending ${eventName} event for Node ${formatNodeId(nodeId)}`);
+                            ws.send(toBigIntAwareJson({ event: eventName, data: nodeDetails }));
+                        } catch (err) {
+                            logger.error(
+                                `[${connId}] Failed to collect node details for Node ${formatNodeId(nodeId)}`,
+                                err,
+                            );
+                        }
                         break;
+                    }
                     case "node_removed":
                         logger.debug(`[${connId}] Sending node_removed event for Node ${formatNodeId(nodeId)}`);
                         ws.send(toBigIntAwareJson({ event: eventName, data: nodeId }));
@@ -163,8 +163,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
                 if (this.#closed) return;
                 const { endpointId, clusterId, attributeId } = data.path;
                 const pathStr = `${endpointId}/${clusterId}/${attributeId}`;
-                const cluster = getClusterById(clusterId);
-                const clusterData = ClusterMap[cluster.name.toLowerCase()];
+                const clusterData = ClusterMap[clusterId];
                 const value = convertMatterToWebSocketTagBased(
                     data.value,
                     clusterData?.attributes[attributeId],
@@ -321,7 +320,9 @@ export class WebSocketControllerHandler implements WebServerHandler {
             );
         });
 
-        await this.#commandHandler.connect();
+        // Initialize all nodes (populates attribute caches) and start connecting them.
+        // Guarded internally so it runs exactly once even with multiple listen addresses.
+        await this.#commandHandler.initializeNodes();
     }
 
     unregister(): Promise<void> {
@@ -372,7 +373,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
             let enableListeners: boolean | undefined = undefined;
             switch (command) {
                 case "start_listening":
-                    result = await this.#handleStartListening(args);
+                    result = this.#handleStartListening(args);
                     enableListeners = true;
                     break;
                 case "set_default_fabric_label":
@@ -388,7 +389,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
                     result = await this.#handleGetNode(args);
                     break;
                 case "get_nodes":
-                    result = await this.#handleGetNodes(args);
+                    result = this.#handleGetNodes(args);
                     break;
                 case "get_node_ip_addresses":
                     result = await this.#handleGetNodeIpAddresses(args);
@@ -414,7 +415,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
                 case "diagnostics":
                     result = {
                         info: await this.#getServerInfo(),
-                        nodes: await this.#handleGetNodes(args),
+                        nodes: this.#handleGetNodes(args),
                         events: this.getEventHistory(),
                     };
                     break;
@@ -543,8 +544,8 @@ export class WebSocketControllerHandler implements WebServerHandler {
         this.#broadcastEvent("server_info_updated", serverInfo);
     }
 
-    async #handleStartListening(_args: ArgsOf<"start_listening">): Promise<ResponseOf<"start_listening">> {
-        return await this.#handleGetNodes({});
+    #handleStartListening(_args: ArgsOf<"start_listening">): ResponseOf<"start_listening"> {
+        return this.#handleGetNodes({});
     }
 
     async #handleSetDefaultFabricLabel(
@@ -592,7 +593,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
             threadCredentials,
         });
 
-        return await this.#collectNodeDetails(nodeId);
+        return this.#collectNodeDetails(nodeId);
     }
 
     async #handleCommissionOnNetwork(
@@ -640,15 +641,15 @@ export class WebSocketControllerHandler implements WebServerHandler {
 
         const { nodeId } = await this.#commandHandler.commissionNode(commissionRequest);
 
-        return await this.#collectNodeDetails(nodeId);
+        return this.#collectNodeDetails(nodeId);
     }
 
-    async #handleGetNodes(args: ArgsOf<"get_nodes">): Promise<ResponseOf<"get_nodes">> {
+    #handleGetNodes(args: ArgsOf<"get_nodes">): ResponseOf<"get_nodes"> {
         const { only_available = false } = args ?? {};
         const nodeDetails = new Array<MatterNode>();
         // Include real nodes
         for (const node of this.#commandHandler.getNodeIds()) {
-            const details = await this.#collectNodeDetails(node);
+            const details = this.#collectNodeDetails(node);
             if (!only_available || details.available) {
                 nodeDetails.push(details);
             }
@@ -673,9 +674,9 @@ export class WebSocketControllerHandler implements WebServerHandler {
 
         // Pass the last interview date for real nodes
         if (handler === this.#commandHandler) {
-            return await this.#commandHandler.getNodeDetails(nodeId, this.#lastInterviewDates.get(nodeId));
+            return this.#commandHandler.getNodeDetails(nodeId, this.#lastInterviewDates.get(nodeId));
         }
-        return await handler.getNodeDetails(nodeId);
+        return handler.getNodeDetails(nodeId);
     }
 
     async #handleGetNodeIpAddresses(
@@ -969,9 +970,9 @@ export class WebSocketControllerHandler implements WebServerHandler {
         return await this.#commandHandler.updateNode(NodeId(node_id), targetVersion);
     }
 
-    async #collectNodeDetails(nodeId: NodeId): Promise<MatterNode> {
+    #collectNodeDetails(nodeId: NodeId): MatterNode {
         const lastInterviewDate = this.#lastInterviewDates.get(nodeId);
-        return await this.#commandHandler.getNodeDetails(nodeId, lastInterviewDate);
+        return this.#commandHandler.getNodeDetails(nodeId, lastInterviewDate);
     }
 
     #convertCommandDataToWebSocketTagBased(
@@ -981,8 +982,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
         clusterData?: ClusterMapEntry,
     ) {
         if (!clusterData) {
-            const cluster = getClusterById(clusterId);
-            clusterData = clusterData ?? ClusterMap[cluster.name.toLowerCase()];
+            clusterData = ClusterMap[clusterId];
         }
 
         if (clusterData === undefined || clusterData.commands[commandName.toLowerCase()] === undefined) {
