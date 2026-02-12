@@ -545,7 +545,10 @@ export class WebSocketControllerHandler implements WebServerHandler {
     }
 
     #handleStartListening(_args: ArgsOf<"start_listening">): ResponseOf<"start_listening"> {
-        return this.#handleGetNodes({});
+        logger.info("WebSocket server start_listening");
+        const data = this.#handleGetNodes({});
+        logger.info("WebSocket server start_listening. Returned", data.length, "nodes");
+        return data;
     }
 
     async #handleSetDefaultFabricLabel(
