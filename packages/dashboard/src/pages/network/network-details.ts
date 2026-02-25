@@ -254,8 +254,21 @@ export class NetworkDetails extends LitElement {
                       <div class="section">
                           <h4>Connections (${connections.length})</h4>
                           <div class="neighbors-list">
-                              ${connections.map((conn: NodeConnection) => {
-                                  return html`
+                              ${connections
+                                  .toSorted((a, b) => {
+                                      const score = (conn: NodeConnection): number => {
+                                          if (conn.rssi !== null && conn.rssi !== undefined) {
+                                              return conn.rssi;
+                                          }
+                                          if (conn.lqi !== null && conn.lqi !== undefined) {
+                                              return conn.lqi;
+                                          }
+                                          return -Infinity;
+                                      };
+                                      return score(b) - score(a);
+                                  })
+                                  .map((conn: NodeConnection) => {
+                                      return html`
                                       <div
                                           class="neighbor-item clickable"
                                           role="button"
@@ -303,7 +316,7 @@ export class NetworkDetails extends LitElement {
                                           </div>
                                       </div>
                                   `;
-                              })}
+                                  })}
                           </div>
                       </div>
                   `
@@ -623,13 +636,21 @@ export class NetworkDetails extends LitElement {
                       <div class="section">
                           <h4>Connected Nodes</h4>
                           <div class="connected-nodes-list">
-                              ${ap.connectedNodes.map(nodeId => {
-                                  const node = this.nodes[nodeId.toString()];
-                                  if (!node) return nothing;
-                                  const wifiDiag = getWiFiDiagnostics(node);
-                                  const signalColor = getSignalColorFromRssi(wifiDiag.rssi);
+                              ${ap.connectedNodes
+                                  .toSorted((a, b) => {
+                                      const nodeA = this.nodes[a.toString()];
+                                      const nodeB = this.nodes[b.toString()];
+                                      const rssiA = nodeA ? (getWiFiDiagnostics(nodeA)?.rssi ?? -Infinity) : -Infinity;
+                                      const rssiB = nodeB ? (getWiFiDiagnostics(nodeB)?.rssi ?? -Infinity) : -Infinity;
+                                      return rssiB - rssiA;
+                                  })
+                                  .map(nodeId => {
+                                      const node = this.nodes[nodeId.toString()];
+                                      if (!node) return nothing;
+                                      const wifiDiag = getWiFiDiagnostics(node);
+                                      const signalColor = getSignalColorFromRssi(wifiDiag.rssi);
 
-                                  return html`
+                                      return html`
                                       <div
                                           class="connected-node-item clickable"
                                           role="button"
@@ -651,7 +672,7 @@ export class NetworkDetails extends LitElement {
                                           }
                                       </div>
                                   `;
-                              })}
+                                  })}
                           </div>
                       </div>
                   `
