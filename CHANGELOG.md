@@ -9,6 +9,12 @@ This page shows a detailed overview of the changes between versions without the 
 
 ## __WORK IN PROGRESS__
 - Fix: Initializes the Fabric storage when migrating from Python server to prevent startup issues
+- Fix: Update matter.js to the latest 0.17.0-nightly
+  - Increase subscription timeout with 8-second bonus time
+  - Re-introduce data version filter refresh after incomplete reads or subscriptions
+  - Ensures delivery of all events to the ChangeNotificationService (and to WebSocket clients)
+  - Restores processing of incoming data reports from the final message directly rather than after receiving the acknowledgement
+  - Prepares configuration options for the network profiles (official support introduced in a later release)
 
 ## 0.5.3 (2026-03-07)
 - Fix: Update matter.js to the latest 0.17.0-nightly
