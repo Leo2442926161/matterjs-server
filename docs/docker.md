@@ -59,6 +59,13 @@ docker run -d \
 > [!NOTE]
 > The container uses environment variables for configuration by default (`STORAGE_PATH=/data`). You can override any setting using environment variables or CLI arguments.
 
+> [!WARNING]
+> **Security:** The server binds to all network interfaces by default. You are responsible for
+> securing access according to your requirements and use-case — for example by setting
+> `LISTEN_ADDRESS=127.0.0.1` to restrict the WebSocket port to localhost, setting
+> `PRIMARY_INTERFACE=eth0` to control which interface Matter uses, or placing a firewall or
+> authenticating reverse proxy in front of the server.
+
 ### Command Line Options
 
 You can also pass CLI arguments directly (these override environment variables):
@@ -91,7 +98,7 @@ All CLI options can be configured via environment variables, making it easy to c
 | `PORT`                | WebSocket server port                                | `5580`               | Any valid port number                                                           |
 | `LISTEN_ADDRESS`      | IP address to bind WebSocket server                  | (all interfaces)     | Single IP address (use CLI for multiple)                                        |
 | `LOG_LEVEL`           | Server logging verbosity                             | `info`               | `critical`, `error`, `warning`, `info`, `debug`, `verbose`                      |
-| `LOG_FILE`            | Log file path                                        | (none)               | Any valid file path                                                             |
+| `LOG_FILE`            | Log file path (must include filename, not just dir)  | (none)               | e.g. `/data/logs/matter-server.log`                                             |
 | `PRIMARY_INTERFACE`   | Primary network interface for mDNS                   | (auto-detect)        | e.g., `eth0`, `en0`                                                             |
 | `ENABLE_TEST_NET_DCL` | Enable test-net DCL certificates                     | `false`              | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`                                 |
 | `BLUETOOTH_ADAPTER`   | Bluetooth adapter HCI ID                             | (none)               | e.g., `0` for `hci0`, but see [this workaround](#device-discovery-via-host-ble) |
@@ -103,7 +110,18 @@ All CLI options can be configured via environment variables, making it easy to c
 | `FABRIC_ID`           | Fabric ID for the Fabric                             | `1`                  | Any valid fabric ID                                                             |
 
 > [!NOTE]
+> `LOG_FILE` must be a full file path including the filename, not a directory. The log is rotated
+> every 24 hours, and on each startup: backups are shifted (`.6`→`.7`, …, `.1`→`.2`, current→`.1`),
+> keeping up to seven daily backup files (≈ 7 days of history). No further cleanup is performed.
+
+> [!NOTE]
 > The `LISTEN_ADDRESS` environment variable only supports a single address. Use the CLI `--listen-address` option (repeatable) to bind to multiple addresses.
+
+### Advanced matter.js Configuration
+
+For advanced matter.js library configuration via `MATTER_*` environment variables (e.g.
+`MATTER_DCL_PRODUCTION_URL` for a self-hosted DCL node), see
+[Advanced matter.js Configuration](cli.md#advanced-matterjs-configuration) in the CLI docs.
 
 Example with environment variables:
 

@@ -7,6 +7,9 @@ This page shows a detailed overview of the changes between versions without the 
 	## __WORK IN PROGRESS__
 -->
 
+## __WORK IN PROGRESS__
+- Enhancement: Adds log file rotation (seven daily backups, rotated on startup and every 24 hours) when --log-file is specified
+
 ## 0.5.4 (2026-03-08)
 - Fix: Initializes the Fabric storage when migrating from Python server to prevent startup issues
 - Fix: Update matter.js to the latest 0.17.0-nightly
