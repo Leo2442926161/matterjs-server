@@ -133,6 +133,7 @@ __all__ = [
     "SoftwareDiagnostics",
     "Switch",
     "TargetNavigator",
+    "TclDehumidifierCluster",
     "TemperatureControl",
     "TemperatureMeasurement",
     "Thermostat",
