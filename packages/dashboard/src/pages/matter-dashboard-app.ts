@@ -9,9 +9,8 @@ import { MatterClient, MatterError } from "@matter-server/ws-client";
 import { mdiRefresh } from "@mdi/js";
 import { LitElement, PropertyValueMap, css, html } from "lit";
 import { customElement, state } from "lit/decorators.js";
-import { clientContext } from "../client/client-context.js";
+import { clientContext, tickContext } from "../client/client-context.js";
 import "../components/ha-svg-icon";
-import { clone } from "../util/clone_class.js";
 import type { Route } from "../util/routing.js";
 import "./components/header";
 import type { ActiveView } from "./components/header.js";
@@ -45,10 +44,13 @@ class MatterDashboardApp extends LitElement {
     @state()
     private _state: "connecting" | "connected" | "error" | "disconnected" = "connecting";
 
+    @state() private _tick = 0;
+
     /** Track whether nodes have been loaded at least once (to avoid redirecting before data arrives) */
     private _nodesLoaded = false;
 
-    private provider = new ContextProvider(this, { context: clientContext, initialValue: this.client });
+    private clientProvider = new ContextProvider(this, { context: clientContext });
+    private tickProvider = new ContextProvider(this, { context: tickContext, initialValue: 0 });
 
     /** Reference to updateRoute function so it can be called from event listeners */
     private _updateRoute?: () => void;
@@ -108,6 +110,8 @@ class MatterDashboardApp extends LitElement {
         this.client.startListening().then(
             () => {
                 this._state = "connected";
+                this.clientProvider.setValue(this.client);
+                this.tickProvider.setValue(++this._tick);
                 this._setupEventListeners();
             },
             (_err: MatterError) => {
@@ -126,10 +130,10 @@ class MatterDashboardApp extends LitElement {
                 this._updateRoute();
             }
             this.requestUpdate();
-            this.provider.setValue(clone(this.client));
+            this.tickProvider.setValue(++this._tick);
         });
         this.client.addEventListener("server_info_updated", () => {
-            this.provider.setValue(clone(this.client));
+            this.tickProvider.setValue(++this._tick);
         });
         this.client.addEventListener("connection_lost", () => {
             this._state = "disconnected";
@@ -198,7 +202,6 @@ class MatterDashboardApp extends LitElement {
             // cluster level
             return html`
                 <matter-cluster-view
-                    .client=${this.client}
                     .node=${this.client.nodes[this._route.path[0]]}
                     .endpoint=${parseInt(this._route.path[1], 10)}
                     .cluster=${parseInt(this._route.path[2], 10)}
@@ -209,7 +212,6 @@ class MatterDashboardApp extends LitElement {
             // endpoint level
             return html`
                 <matter-endpoint-view
-                    .client=${this.client}
                     .node=${this.client.nodes[this._route.path[0]]}
                     .endpoint=${parseInt(this._route.path[1], 10)}
                 ></matter-endpoint-view>
@@ -217,12 +219,7 @@ class MatterDashboardApp extends LitElement {
         }
         if (this._route.prefix === "node") {
             // node level
-            return html`
-                <matter-node-view
-                    .client=${this.client}
-                    .node=${this.client.nodes[this._route.path[0]]}
-                ></matter-node-view>
-            `;
+            return html` <matter-node-view .node=${this.client.nodes[this._route.path[0]]}></matter-node-view> `;
         }
         // Get device counts for conditional navigation
         const { hasThreadDevices, hasWifiDevices } = this._getDeviceCounts();
@@ -230,7 +227,6 @@ class MatterDashboardApp extends LitElement {
         // Check for Thread view (#thread or #thread/123)
         if (this._route.prefix === "thread" || this._route.path[0] === "thread") {
             return html`<matter-network-view
-                .client=${this.client}
                 .nodes=${this.client.nodes}
                 .activeView=${this._activeView}
                 .initialSelectedNodeId=${this._initialSelectedNodeId}
@@ -242,7 +238,6 @@ class MatterDashboardApp extends LitElement {
         // Check for WiFi view (#wifi or #wifi/123)
         if (this._route.prefix === "wifi" || this._route.path[0] === "wifi") {
             return html`<matter-network-view
-                .client=${this.client}
                 .nodes=${this.client.nodes}
                 .activeView=${this._activeView}
                 .initialSelectedNodeId=${this._initialSelectedNodeId}
@@ -253,7 +248,6 @@ class MatterDashboardApp extends LitElement {
         }
         // root level: server overview (nodes view)
         return html`<matter-server-view
-            .client=${this.client}
             .nodes=${this.client.nodes}
             .route=${this._route}
             .activeView=${this._activeView}

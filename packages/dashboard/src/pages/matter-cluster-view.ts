@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { provide } from "@lit/context";
+import { consume, provide } from "@lit/context";
 import "@material/web/button/outlined-button";
 import "@material/web/divider/divider";
 import "@material/web/iconbutton/icon-button";
@@ -16,6 +16,7 @@ import { mdiAlertCircleOutline, mdiPencil, mdiPlay, mdiRefresh } from "@mdi/js";
 import { css, html, LitElement, nothing, type TemplateResult } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import { unsafeHTML } from "lit/directives/unsafe-html.js";
+import { clientContext, tickContext } from "../client/client-context.js";
 import { clusters } from "../client/models/descriptions.js";
 import { showAlertDialog } from "../components/dialog-box/show-dialog-box.js";
 import { showAttributeWriteDialog } from "../components/dialogs/dev/show-attribute-write-dialog.js";
@@ -74,7 +75,11 @@ function clusterAttributes(attributes: { [key: string]: any }, endpoint: number,
 
 @customElement("matter-cluster-view")
 class MatterClusterView extends LitElement {
+    @consume({ context: clientContext })
     public client!: MatterClient;
+
+    @consume({ context: tickContext, subscribe: true })
+    protected _tick = 0;
 
     @property()
     public node?: MatterNode;
@@ -108,7 +113,7 @@ class MatterClusterView extends LitElement {
     override render() {
         if (!this.node || this.endpoint == undefined || this.cluster == undefined) {
             return html`
-                <dashboard-header title="Not found" .client=${this.client} backButton="#"></dashboard-header>
+                <dashboard-header title="Not found" backButton="#"></dashboard-header>
                 <div class="not-found">
                     <ha-svg-icon .path=${mdiAlertCircleOutline}></ha-svg-icon>
                     <p>Node, endpoint, or cluster not found</p>
@@ -130,12 +135,11 @@ class MatterClusterView extends LitElement {
             <dashboard-header
                 .title=${`Node ${this.node.node_id} ${nodeHex}  |  Endpoint ${this.endpoint}  |  Cluster ${this.cluster} (${clusterName})`}
                 .backButton=${`#node/${this.node.node_id}/${this.endpoint}`}
-                .client=${this.client}
             ></dashboard-header>
 
             <!-- node details section -->
             <div class="container">
-                <node-details .node=${this.node} .client=${this.client}></node-details>
+                <node-details .node=${this.node}></node-details>
             </div>
 
             <!-- Cluster commands section (if available for this cluster) -->
@@ -375,8 +379,7 @@ class MatterClusterView extends LitElement {
         const container = this.shadowRoot?.getElementById("cluster-commands-container");
         if (container) {
             const commandsElement = container.firstElementChild as any;
-            if (commandsElement && this.node && this.client) {
-                commandsElement.client = this.client;
+            if (commandsElement && this.node) {
                 commandsElement.node = this.node;
                 commandsElement.endpoint = this.endpoint;
                 commandsElement.cluster = this.cluster;
