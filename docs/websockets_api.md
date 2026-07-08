@@ -644,6 +644,90 @@ Entry fields:
 }
 ```
 
+### ICD Management
+
+Manage this controller's Intermittently Connected Device (ICD) Check-In registration with a peer node.
+Read the details about ICD devices and consequences of changing the ICD mode carefully before applying any changes.
+
+**get_icd_state** - Get ICD state for a node
+
+```json
+{
+  "message_id": "1",
+  "command": "get_icd_state",
+  "args": {
+    "node_id": 1
+  }
+}
+```
+
+Response (`IcdStateData`):
+
+```json
+{
+  "supported": true,
+  "lit_supported": true,
+  "registered": true,
+  "operating_mode": "LIT",
+  "awake": false,
+  "available": true,
+  "next_expected_checkin": 1735689600000
+}
+```
+
+If the node has no ICD Management cluster, `supported` is `false` and all other fields are `false`/`null`.
+
+**register_icd** - Register this controller as an ICD Check-In client
+
+```json
+{
+  "message_id": "1",
+  "command": "register_icd",
+  "args": {
+    "node_id": 1,
+    "allow_multi_admin": false,
+    "ignored_vendors": [4874]
+  }
+}
+```
+
+Response: `IcdStateData` (see `get_icd_state`).
+
+Fails with error code `100 IcdMultiAdmin` if the peer has other-vendor administrators and `allow_multi_admin` is not set.
+
+**unregister_icd** - Drop this controller's ICD Check-In registration
+
+If other ecosystems are still registered the device might stay in the LIT mode, and connecting to the device might take a long time, and the server might automatically re-register after the next connection.
+
+```json
+{
+  "message_id": "1",
+  "command": "unregister_icd",
+  "args": {
+    "node_id": 1,
+    "force": false
+  }
+}
+```
+
+Response: `IcdStateData` (see `get_icd_state`). `force` skips the peer round-trip (for an unreachable peer) and only clears local state.
+
+**resync_icd** - Drop the local ICD registration and reconnect
+
+This should be the last resort to try to get an ICD device in LIT mode connected again. Before doing this try to restart the device. It can take up to the "maximum IdleMode Time" of the device before it reconnects.
+
+```json
+{
+  "message_id": "1",
+  "command": "resync_icd",
+  "args": {
+    "node_id": 1
+  }
+}
+```
+
+A LIT peer re-registers automatically once subscribed.
+
 ### Vendor Information
 
 **get_vendor_names** - Get vendor names by ID
@@ -890,6 +974,7 @@ Error codes match the [Python Matter Server](https://github.com/home-assistant-l
 | 9 | InvalidCommand | Invalid/unknown command |
 | 10 | UpdateCheckError | OTA update check failed |
 | 11 | UpdateError | OTA update failed |
+| 100 | IcdMultiAdmin | OHF extension (not in Python Matter Server). ICD registration rejected because other-vendor administrator fabrics may not support LIT. `details` is a JSON string: `{"message": string, "admin_vendor_ids": number[]}` |
 
 ## Python Matter Server Compatibility
 
@@ -909,6 +994,10 @@ These commands are available only in the Matter.js server and not in the Python 
 |---------|-------------|
 | `get_loglevel` | Get current console and file log levels |
 | `set_loglevel` | Temporarily change log levels (resets on restart) |
+| `get_icd_state` | Get ICD Check-In state for a node |
+| `register_icd` | Register this controller as an ICD Check-In client |
+| `unregister_icd` | Drop this controller's ICD Check-In registration |
+| `resync_icd` | Drop the local ICD registration and reconnect |
 
 ### Data Differences
 
