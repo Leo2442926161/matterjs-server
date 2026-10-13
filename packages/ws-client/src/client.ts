@@ -6,6 +6,7 @@
 
 import { Connection, WebSocketFactory } from "./connection.js";
 import { CommandTimeoutError, ConnectionClosedError, InvalidServerVersion, ServerCommandError } from "./exceptions.js";
+import { redactIncomingMessage } from "./logging-redaction.js";
 import {
     AccessControlEntry,
     AllCredentialsSummary,
@@ -25,12 +26,21 @@ import {
     ResponseOf,
     SuccessResultMessage,
     ThreadDiagnosticsBatch,
+    CameraSessionEndedData,
+    CameraStreamEvictedData,
     WebRtcCallbackData,
+    WebRtcProviderCommandName,
 } from "./models/model.js";
 import { MatterNode } from "./models/node.js";
 
 /** Union type for all incoming WebSocket messages */
 type IncomingMessage = EventMessage | ErrorResultMessage | SuccessResultMessage;
+
+/** Schema 14 is when the server started relaying these two; the offer commands need only schema 12. */
+const SIGNALLING_PROVIDER_COMMANDS: ReadonlySet<WebRtcProviderCommandName> = new Set([
+    "ProvideAnswer",
+    "ProvideIceCandidates",
+]);
 
 /** Converts node_id to string for use as object key (works for both number and bigint without precision loss) */
 function toNodeKey(nodeId: number | bigint): string {
@@ -99,6 +109,8 @@ export class MatterClient {
     private msgId = Math.floor(Math.random() * 0x7fffffff);
     private eventListeners: Record<string, Array<() => void>> = {};
     private webrtcCallbackListeners: Array<(data: WebRtcCallbackData) => void> = [];
+    private cameraSessionEndedListeners: Array<(data: CameraSessionEndedData) => void> = [];
+    private cameraStreamEvictedListeners: Array<(data: CameraStreamEvictedData) => void> = [];
     private threadDiagnosticsListeners: Array<(batch: ThreadDiagnosticsBatch) => void> = [];
     private nodeEventListeners: Array<(event: MatterNodeEvent) => void> = [];
 
@@ -140,6 +152,26 @@ export class MatterClient {
         this.webrtcCallbackListeners.push(listener);
         return () => {
             this.webrtcCallbackListeners = this.webrtcCallbackListeners.filter(l => l !== listener);
+        };
+    }
+
+    /**
+     * Subscribe to camera_session_ended events. Returns an unsubscribe function.
+     *
+     * The server sends them only to a connection that has issued a camera command.
+     */
+    addCameraSessionEndedListener(listener: (data: CameraSessionEndedData) => void): () => void {
+        this.cameraSessionEndedListeners.push(listener);
+        return () => {
+            this.cameraSessionEndedListeners = this.cameraSessionEndedListeners.filter(l => l !== listener);
+        };
+    }
+
+    /** Subscribe to camera_stream_evicted events. Returns an unsubscribe function. */
+    addCameraStreamEvictedListener(listener: (data: CameraStreamEvictedData) => void): () => void {
+        this.cameraStreamEvictedListeners.push(listener);
+        return () => {
+            this.cameraStreamEvictedListeners = this.cameraStreamEvictedListeners.filter(l => l !== listener);
         };
     }
 
@@ -496,13 +528,13 @@ export class MatterClient {
     async sendWebRtcProviderCommand(
         nodeId: number | bigint,
         endpointId: number,
-        commandName: "ProvideOffer" | "SolicitOffer",
+        commandName: WebRtcProviderCommandName,
         payload: Record<string, unknown>,
         timeout?: number,
     ): Promise<unknown> {
         return await this.sendCommand(
             "send_webrtc_provider_command",
-            0,
+            SIGNALLING_PROVIDER_COMMANDS.has(commandName) ? 14 : 12,
             { node_id: nodeId, endpoint_id: endpointId, command_name: commandName, payload },
             timeout,
         );
@@ -736,11 +768,11 @@ export class MatterClient {
             return;
         }
 
-        console.warn("Received message with unknown format", msg);
+        console.warn("Received message with unknown format", redactIncomingMessage(msg));
     }
 
     private _handleEventMessage(event: EventMessage) {
-        console.debug("Incoming event", event);
+        console.debug("Incoming event", redactIncomingMessage(event));
 
         // Allow subclasses to hook into raw events (for testing)
         this.onRawEvent(event);
@@ -803,6 +835,20 @@ export class MatterClient {
 
         if (event.event === "webrtc_callback") {
             for (const listener of this.webrtcCallbackListeners) {
+                listener(event.data);
+            }
+            return;
+        }
+
+        if (event.event === "camera_session_ended") {
+            for (const listener of this.cameraSessionEndedListeners) {
+                listener(event.data);
+            }
+            return;
+        }
+
+        if (event.event === "camera_stream_evicted") {
+            for (const listener of this.cameraStreamEvictedListeners) {
                 listener(event.data);
             }
             return;

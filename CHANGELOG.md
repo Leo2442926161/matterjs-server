@@ -9,11 +9,16 @@ This page shows a detailed overview of the changes between versions without the 
 
 ## **WORK IN PROGRESS**
 
+- Feature: Introduces Websocket Schema version 14 (backward compatible), detectable with `server_info.schema_version >= 14`. Details are in [docs/websockets_api.md](docs/websockets_api.md#camera-streaming-schema-14) and [docs/websocket-api-schema-changelog.md](docs/websocket-api-schema-changelog.md)
+    - Adds a camera API that handles stream management and WebRTC sessions for the client, see[docs/CAMERA_LIMITATIONS.md](docs/CAMERA_LIMITATIONS.md) for information on defaults and known camera quirks. The Matter commands through `send_webrtc_provider_command` and `device_command` stay available
+    - Adds error codes 102 to 106 for camera failures in the server and both clients
+    - The TypeScript client's `ServerCommandError` carries typed error details (`details`, `hasDetails(code)`); the Python client has typed camera methods, results, events and errors
+    - The dashboard's camera view uses the new camera API
 - Enhancement: Update matter.js to the latest 0.18.0 nightly
     - Adds support for Matter 1.6.1 (including Python client)
 - Enhancement: Finishes the migration to the new matter.js controller API
-- Fix: A wrong pairing code is reported as such instead of as a generic commissioning failure, so a client can ask for the code again
-- Enhancement: (@RaHehl) `open_commissioning_window` also returns `discriminator`, `vendor_id`, `product_id` and `commissioning_timeout` (seconds) as reported by matter.js, so clients can hand the data to another ecosystem without decoding the QR code
+- Enhancement: `send_webrtc_provider_command` also relays `ProvideAnswer` and `ProvideIceCandidates`
+- Enhancement: (@RaHehl) `open_commissioning_window` also returns `discriminator`, `vendor_id`, `product_id` and `commissioning_timeout` (seconds) as reported by matter.js, so clients can hand the data to another ecosystem without decoding the QR code.
 - Enhancement: Dashboard network view uses the Thread 1.4 role names: a Thread Router is shown as "Mesh Extender" and a REED as "Standby Mesh Extender". External (non-fabric) neighbors, whose role is only inferred from rx-on-when-idle, are now labeled "Always-on device" instead of a routing role. Wire values and the `ThreadRoutingRole` enum keep the Matter spec names
 - Enhancement: (@cyberb) `--listen-address` (env `LISTEN_ADDRESS`) accepts an absolute unix socket path, so the WebSocket API and dashboard can be served on a local socket, alone or next to TCP addresses; a socket file left behind by an unclean shutdown is replaced on the next start, and the Docker health check queries the socket
 - Enhancement: (@cyberb) The Python client connects over a unix socket when given a `unix://<path>` server URL, including OTA image uploads
@@ -35,8 +40,18 @@ This page shows a detailed overview of the changes between versions without the 
 - Enhancement: Adds the IKEA thermostat ValveCalibration vendor cluster (0x117cfc01) to the custom cluster and a Dashboard panel
 - Enhancement: (@lboue) Allows creating temporary/expiring PIN users (UserType=ExpiringUser) and configuring the lock's ExpiringUserTimeout to the Dashboard DoorLock cluster panel
 - Enhancement: (@RAR) Adds the vendor clusters of the Aqara Spatial Multi-Sensor FP400 (AmbientSensingConfiguration 0x115ffc0a with detection zones, RadarSensingUnion 0x115ffc0b, OccupantLocation 0x115ffc0c with the target position event) to the custom cluster definitions and the Python client
+- Adjustment: Commands that target a node refuse a `node_id` that can never name one (CAT, PAKE, Unspecified, reserved ranges) with error 8 instead of `NODE_NOT_EXISTS`, and only the Temporary Local range is routed to imported test nodes
+- Adjustment: Every command treats a missing or `null` `args` as no arguments and refuses a non-object with error 8
+- Adjustment: `send_webrtc_provider_command` checks `node_id`, `endpoint_id` and every payload field against the cluster definition and refuses a bad one with error 8 instead of failing later or silently dropping data. It accepts the documented `ice_servers` shape and the key spellings `webrtc_callback` uses, and no longer drops streams before the camera's first report
 - Adjustment: A node counts as available based on its connection state alone. The former 3-minute grace period after a connection loss is gone, so an unreachable node is reported as soon as matter.js gives up on reaching it rather than after a fixed timer on top
 - Adjustment: Dashboard network view uses the Thread 1.4 role names
+- Fix: `webrtc_callback` events the camera sends while `send_webrtc_provider_command` is still running are no longer lost
+- Fix: A re-offer (`ProvideOffer` naming an existing session) through `send_webrtc_provider_command` no longer ends the session it renegotiates
+- Fix: `device_command` with `EndSession` updates the server's session records for that camera only, and a WebRTC callback with an invalid endpoint id no longer blocks the event for other listeners
+- Fix: A command sent before the controller finished starting fails with the SDK stack error code instead of a generic error
+- Fix: The server's debug log masks Wi-Fi passphrases, Thread datasets, setup codes, credential material in `device_command` requests, TURN credentials and SDP ICE credentials, and no longer logs the `open_commissioning_window` response. `device_command` responses are still logged in full. The TypeScript client logs very long strings as their length
+- Fix: The Python client delivers `webrtc_callback` and the camera events to subscribers registered with `node_filter`, as Home Assistant does
+- Fix: A wrong pairing code is reported as such instead of as a generic commissioning failure, so a client can ask for the code again
 - Fix: Dashboard shows manufacturer-specific enum values (vendor mode tags, operational and error states, closure errors) as "Manufacturer 0x…"
 - Fix: (@RAR) List values of decorator-defined custom clusters are converted in both directions, so bytes inside a list (Aqara `SetZones`) reach the device as bytes instead of strings. The same fix sends `SupportedModes` of the derived Mode clusters (RVC Run/Clean, Dishwasher, Laundry Washer, Oven, Microwave Oven, Refrigerator, Device Energy Management, EVSE and Water Heater Mode) keyed by tag like every other attribute value, instead of keyed by field name
 - Fix: (@RAR) The Python client generator resolves struct, signed integer, list and response types of decorator-defined custom clusters; the `int32` attributes `DraftElectricalMeasurementCluster.activePower` and `ThirdRealityMeteringCluster.instantaneousDemand` are now generated as signed
