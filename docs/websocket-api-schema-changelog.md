@@ -123,6 +123,10 @@ OHF extensions; python-matter-server codes stop at 11. Each carries JSON details
 
 - **`discriminator`, `vendor_id`, `product_id`, `commissioning_timeout` in the `open_commissioning_window` result** (presence-detectable only: some schema-13 servers send them too, so check for the fields, not the schema version). `discriminator` is the long (12-bit) discriminator the device advertises while the window is open, `vendor_id`/`product_id` are the device's Vendor-ID and Product-ID from the BasicInformation cluster, `commissioning_timeout` is the window duration in seconds. They match the values encoded in the returned pairing codes; they are returned separately so clients (for example mobile apps sharing the device to another ecosystem) need no Matter QR decoder.
 
+### Node data
+
+- **`endpoint_parents` in node data** (every message that carries node data, for example `get_node`, `start_listening` and `node_updated`). Maps endpoints in `attributes` other than 0 to their direct parent endpoint (JSON keys are strings), `0` for a top-level endpoint. An endpoint whose parent the server does not know has no entry. A test node imported from a dump without the field has none. When the field is absent (server below schema 14, or such a test node), derive the parents from the Descriptor PartsLists as before.
+
 ## Schema 13
 
 Minimum supported: 11 (older clients keep working with the pre-13 command shapes).
