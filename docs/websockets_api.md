@@ -1613,7 +1613,7 @@ Events are sent to clients that have called `start_listening`. Events have this 
 
 ### Attribute Events
 
-**attribute_updated** - An attribute value changed. Changes from a node's first report, after a server restart or after commissioning, are not sent this way
+**attribute_updated** - An attribute value changed. Values from a node's first report, after a server restart or after commissioning, are not sent this way. A removed attribute is sent with the value `null`, the same as a `null` value of a nullable attribute, also when the server only finds the removal while it rebuilds the node data (after a first report, a reconnect from unavailable or a structure change). Later `node_updated` events no longer contain it. Attributes of an endpoint the device no longer has are not sent this way
 
 ```json
 {
@@ -1623,8 +1623,6 @@ Events are sent to clients that have called `start_listening`. Events have this 
 ```
 
 Format: `[node_id, "endpoint/cluster/attribute", value]`
-
-A removed attribute is sent with the value `null`, the same as a `null` value of a nullable attribute; the next `node_updated` no longer contains it.
 
 ### Endpoint Events
 
