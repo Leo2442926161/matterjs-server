@@ -29,7 +29,6 @@ class SirenActivateCommand {
     duration!: number;
 }
 
-
 @cluster(0x120bfc01)
 export class HeimanCluster {
     @attribute(0x0010, uint8)
