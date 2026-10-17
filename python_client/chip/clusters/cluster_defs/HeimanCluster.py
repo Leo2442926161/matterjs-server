@@ -68,6 +68,26 @@ class HeimanCluster(Cluster):
 
             mutingTime: typing.Optional[uint] = None
 
+        @dataclass
+        class SirenActivate(ClusterCommand):
+            cluster_id: typing.ClassVar[int] = 0x120BFC01
+            command_id: typing.ClassVar[int] = 0x00000001
+            is_client: typing.ClassVar[bool] = True
+            response_type: typing.ClassVar[typing.Optional[str]] = None
+
+            @ChipUtility.classproperty
+            def descriptor(cls) -> ClusterObjectDescriptor:
+                return ClusterObjectDescriptor(
+                    Fields=[
+                        ClusterObjectFieldDescriptor(Label="sirenType", Tag=0, Type=typing.Optional[uint]),
+                        ClusterObjectFieldDescriptor(Label="volume", Tag=1, Type=typing.Optional[uint]),
+                        ClusterObjectFieldDescriptor(Label="duration", Tag=2, Type=typing.Optional[uint]),
+                    ])
+
+            sirenType: typing.Optional[uint] = None
+            volume: typing.Optional[uint] = None
+            duration: typing.Optional[uint] = None
+
     class Attributes:
         @dataclass
         class TamperAlarm(ClusterAttributeDescriptor):

@@ -10,22 +10,24 @@ import { attribute, cluster, uint8, writable, command, uint16, field } from "@ma
  * Input to the {@link HeimanCluster.mutingSensor} command.
  */
 class MutingSensorCommand {
-    @field(uint16)
+    @field(0x0, uint16)
     mutingTime!: number;
 }
 
 /**
  * Input to the {@link HeimanCluster.sirenActivate} command.
- * sirenType: 0(default) 1(smoke siren) 2(co siren) 3(gas siren) 4(doorbell) 5(heat alarm siren)
- * volume: 0 ~ 100 (some of models may not support volume setting, but the device will ignore this para)
- * duration: 0(stop the siren) 1 ~ 0xfffe(specific duration) 0xffff(forever)
  */
 class SirenActivateCommand {
-    @field(uint8)
+    /** 0 default, 1 smoke, 2 CO, 3 gas, 4 doorbell, 5 heat alarm. */
+    @field(0x0, uint8)
     sirenType!: number;
-    @field(uint8)
+
+    /** 0 to 100. Models without volume control ignore the value. */
+    @field(0x1, uint8)
     volume!: number;
-    @field(uint16)
+
+    /** 0 stops the siren, 1 to 0xfffe sounds it for that duration, 0xffff sounds it until stopped. */
+    @field(0x2, uint16)
     duration!: number;
 }
 
@@ -62,7 +64,7 @@ export class HeimanCluster {
     mutingSensor(_request: MutingSensorCommand): void {}
 
     /**
-     * This command is used for activate sensor's siren for a specific period.
+     * Sounds or stops the sensor's siren.
      */
     @command(0x01, SirenActivateCommand)
     sirenActivate(_request: SirenActivateCommand): void {}

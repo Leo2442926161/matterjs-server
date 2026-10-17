@@ -18817,6 +18817,12 @@ export const clusters: Record<number, ClusterDescription> = {
                 "cluster_id": 302775297,
                 "name": "mutingSensor",
                 "label": "Muting Sensor"
+            },
+            "1": {
+                "id": 1,
+                "cluster_id": 302775297,
+                "name": "sirenActivate",
+                "label": "Siren Activate"
             }
         },
         "features": {}
