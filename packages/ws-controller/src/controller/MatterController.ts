@@ -16,6 +16,7 @@ import {
     FabricId,
     GlobalFabricId,
     Logger,
+    ImplementationError,
     MatterAggregateError,
     Millis,
     NodeId,
@@ -90,6 +91,12 @@ export interface MatterControllerOptions {
     disableOtaProvider?: boolean;
     /** Disable bundled offline DCL seed data (PAA roots, CD signers, vendors). When true, only network DCL is used. */
     disableDclSeed?: boolean;
+    /**
+     * Never contact the DCL or GitHub for attestation certificates and run no certificate updates or revocation checks;
+     * the trust store is the bundled seed plus certificates stored by earlier runs. Vendor information comes from the
+     * seed and storage, and OTA update checks do not query the DCL.
+     */
+    dclOffline?: boolean;
     /** Server ID for storage. Default is "server", but may be "server-<hex(fabricId)>-<hex(vendorId)>" for multi-fabric support */
     serverId?: string;
     /** Server version string (e.g., "0.2.10" or "0.2.10-alpha.0"). Used for BasicInformation cluster. */
@@ -116,6 +123,11 @@ export interface MatterControllerOptions {
      * (legacy Eve Energy devices). Defaults to, and is floored at, 60 seconds.
      */
     customClusterPollInterval?: Duration;
+    /**
+     * Do not subscribe to peers on our own, neither after commissioning nor when the server starts, unless switched on
+     * per peer. Defaults to false.
+     */
+    disableAutoSubscription?: boolean;
 }
 
 /**
@@ -205,13 +217,16 @@ export class MatterController {
     #enableTestNetDcl = false;
     #disableOtaProvider = true;
     #disableDclSeed = false;
+    #dclOffline = false;
     #bleProxyEnabled = false;
     #enableTimeSync = false;
     #threadDiagnosticsDisabled = false;
     #customClusterPollInterval?: Duration;
+    #disableAutoSubscription = false;
     #otaUploadOptions: OtaUploadOptions = {};
     #otaUploads?: OtaUploadRegistry;
     readonly #borderRouterRegistry: BorderRouterRegistry;
+    #borderRouterDiscoveryStarted = false;
     /** Background init tasks kept off the node-init critical path but given a bounded chance to settle on stop(). */
     readonly #backgroundInit = new Array<Promise<unknown>>();
     #stopped = false;
@@ -298,10 +313,17 @@ export class MatterController {
         this.#enableTestNetDcl = options.enableTestNetDcl ?? this.#enableTestNetDcl;
         this.#disableOtaProvider = options.disableOtaProvider ?? this.#disableOtaProvider;
         this.#disableDclSeed = options.disableDclSeed ?? this.#disableDclSeed;
+        this.#dclOffline = options.dclOffline ?? this.#dclOffline;
+        if (this.#dclOffline && this.#disableDclSeed) {
+            throw new ImplementationError(
+                "dclOffline needs the DCL seed, so it cannot be combined with disableDclSeed",
+            );
+        }
         this.#bleProxyEnabled = options.bleProxyEnabled ?? this.#bleProxyEnabled;
         this.#enableTimeSync = options.enableTimeSync ?? this.#enableTimeSync;
         this.#threadDiagnosticsDisabled = options.disableThreadDiagnostics ?? this.#threadDiagnosticsDisabled;
         this.#customClusterPollInterval = options.customClusterPollInterval;
+        this.#disableAutoSubscription = options.disableAutoSubscription ?? this.#disableAutoSubscription;
         this.#otaUploadOptions = options.otaUpload ?? this.#otaUploadOptions;
         this.#services = this.#env.asDependent();
         this.#threadDiagnostics = new ThreadDiagnosticsService({
@@ -366,6 +388,7 @@ export class MatterController {
                 fetchTestCertificates,
                 fetchGithubCertificates,
                 acceptTestCertificates: trustTestCertificates,
+                offline: this.#dclOffline,
                 seed: {
                     paaRoots: paaRoots({ includeTest: true }),
                     cdSigners: cdSigners({ includeTest: true }),
@@ -373,6 +396,7 @@ export class MatterController {
             });
             new DclVendorInfoService(this.#env.root, {
                 dclConfig,
+                offline: this.#dclOffline,
                 seed: { vendors: vendors({ includeTest: trustTestCertificates }) },
             });
             this.#services.get(DclVendorInfoService);
@@ -388,6 +412,8 @@ export class MatterController {
             serverVersion: this.#serverVersion,
             enableOtaProvider: !this.#disableOtaProvider,
             peerSettingsRepair: this.#config,
+            disableAutoSubscription: this.#disableAutoSubscription,
+            dcl: { acceptTestCertificates: this.#enableTestNetDcl, offline: this.#dclOffline },
         });
     }
 
@@ -404,16 +430,10 @@ export class MatterController {
                 timeSyncEnabled: this.#enableTimeSync,
                 threadDiagnosticsEnabled: !this.#threadDiagnosticsDisabled,
                 customClusterPollInterval: this.#customClusterPollInterval,
+                disableAutoSubscription: this.#disableAutoSubscription,
             });
 
             this.#commandHandler.events.started.once(async () => {
-                if (this.#stopped) return;
-                controller.node.behaviors.require(DclBehavior);
-                await controller.node.setStateOf(DclBehavior, {
-                    fetchTestCertificates: true,
-                    acceptTestCertificates: this.#enableTestNetDcl,
-                });
-                // Re-check after the await — stop() may have run during it; don't start work that outlives teardown.
                 if (this.#stopped) return;
 
                 const initPromises = new Array<Promise<unknown>>();
@@ -432,11 +452,9 @@ export class MatterController {
                 }
 
                 if (!this.#threadDiagnosticsDisabled) {
-                    // Diagnostics-only discovery — never gate node init / WS availability on it.
-                    this.#trackBackgroundInit(
-                        this.#borderRouterRegistry.start(),
-                        "Border router registry start failed",
-                    );
+                    if (!this.#disableAutoSubscription) {
+                        this.startBorderRouterDiscovery();
+                    }
                     this.#registerStoredThreadCredentials();
                 }
 
@@ -449,6 +467,20 @@ export class MatterController {
         }
 
         return this.#commandHandler;
+    }
+
+    /**
+     * Start Border Router discovery, which also probes every Border Router found for a REST API. Started with the
+     * controller, except with auto subscription disabled: then the first command that needs Border Routers starts it.
+     * Never gates node init or WebSocket availability. Returns true when this call started it.
+     */
+    startBorderRouterDiscovery(): boolean {
+        if (this.#threadDiagnosticsDisabled || this.#stopped || this.#borderRouterDiscoveryStarted) {
+            return false;
+        }
+        this.#borderRouterDiscoveryStarted = true;
+        this.#trackBackgroundInit(this.#borderRouterRegistry.start(), "Border router registry start failed");
+        return true;
     }
 
     get borderRouters(): BorderRouterRegistry {
@@ -572,6 +604,17 @@ export class MatterController {
         const service = await this.#controller.node.act(agent => agent.get(DclBehavior).certificateService);
         await service.construction;
         return service;
+    }
+
+    /**
+     * Install revocation information from outside the DCL into the certificate service that judges device
+     * attestation. In memory only, so it must run again on every start.
+     *
+     * @throws {ImplementationError} if an entry states an identifier or serial that is not hex, or an issuer name that
+     * is not base64
+     */
+    installRevocations(entries: DclCertificateService.RevocationSetEntry[]) {
+        this.#services.get(DclCertificateService).installRevocations(entries);
     }
 
     /**

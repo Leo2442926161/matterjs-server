@@ -16,6 +16,7 @@ export {
     type AccessControlEntry,
     type AccessControlTarget,
     type AllCredentialsSummary,
+    type CommissionFailureReason,
     type APICommands,
     type APIEvents,
     type ArgsOf,
@@ -39,6 +40,7 @@ export {
     type SettableLogLevelString,
     type MatterFabricData,
     type MatterNodeEvent,
+    type PathStatus,
     type NodePingResult,
     type NotificationType,
     type OtaUploadTicket,
@@ -65,6 +67,7 @@ import type {
     CameraStreamIncompatibleReason,
     CameraStreamInUseErrorDetails,
     CameraStreamKind,
+    CommissionFailureReason,
     IcdMultiAdminErrorDetails,
 } from "@matter-server/ws-client";
 
@@ -185,6 +188,10 @@ export interface CameraResourceExhaustedDetail {
     maxEncodedPixelRate?: number;
 }
 
+function detailOf(cause?: Error) {
+    return cause === undefined ? "" : `: ${cause.message}`;
+}
+
 /**
  * Custom error class for server errors with typed error codes.
  * Use this to throw errors that will be properly mapped to Python-compatible error codes.
@@ -194,6 +201,7 @@ export class ServerError extends Error {
         public readonly code: ServerErrorCode,
         message: string,
         cause?: Error,
+        public readonly reason?: CommissionFailureReason,
     ) {
         super(message, { cause });
         this.name = "ServerError";
@@ -203,8 +211,8 @@ export class ServerError extends Error {
         return new ServerError(ServerErrorCode.UnknownError, message, cause);
     }
 
-    static nodeCommissionFailed(message: string, cause?: Error): ServerError {
-        return new ServerError(ServerErrorCode.NodeCommissionFailed, message, cause);
+    static nodeCommissionFailed(message: string, reason: CommissionFailureReason, cause?: Error): ServerError {
+        return new ServerError(ServerErrorCode.NodeCommissionFailed, message, cause, reason);
     }
 
     static nodeInterviewFailed(message: string, cause?: Error): ServerError {
@@ -212,11 +220,15 @@ export class ServerError extends Error {
     }
 
     static nodeNotReady(nodeId: number | bigint, cause?: Error): ServerError {
-        return new ServerError(ServerErrorCode.NodeNotReady, `Node ${nodeId} is not ready`, cause);
+        return new ServerError(ServerErrorCode.NodeNotReady, `Node ${nodeId} is not ready${detailOf(cause)}`, cause);
     }
 
     static nodeNotResolving(nodeId: number | bigint, cause?: Error): ServerError {
-        return new ServerError(ServerErrorCode.NodeNotResolving, `Node ${nodeId} is not resolving`, cause);
+        return new ServerError(
+            ServerErrorCode.NodeNotResolving,
+            `Node ${nodeId} is not resolving${detailOf(cause)}`,
+            cause,
+        );
     }
 
     static nodeNotExists(nodeId: number | bigint): ServerError {

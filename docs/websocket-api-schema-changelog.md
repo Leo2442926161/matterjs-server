@@ -110,6 +110,23 @@ OHF extensions; python-matter-server codes stop at 11. Each carries JSON details
   connection that opened it. The opt-in now happens before the command runs, so the camera's first
   answer is no longer lost.
 - **`device_command` with `EndSession`** also produces `camera_session_ended`.
+- **`commission_on_network` `filter_type` 4** searches by the device type in `filter`; before, it
+  searched for any device. Without `filter` it is refused with error 8.
+- **`device_command` `interaction_timeout_ms`** is applied to the command; before, the server accepted
+  it and ignored it. Anything other than an integer from 0 to 2^53-1 is refused with error 8.
+- **New command `batched_device_commands`** `{ node_id, commands: [{ endpoint_id, cluster_id, command_name, payload? }],
+  timed_request_timeout_ms?, interaction_timeout_ms? }` → `[{ status, cluster_status?, response? }]`, one entry per
+  command in request order. Sends all commands in one InvokeRequest, never split or combined with other commands.
+  Refused with `InvalidArguments` before sending: an empty list, a bad command, more commands than the node's
+  MaxPathsPerInvoke, an invalid timeout, a Group Node ID or a WebRTC Transport Provider command.
+- **`device_command`** refuses a command that is not in the server's model for the cluster, or fields matter.js cannot
+  encode, with `InvalidArguments`; before, it failed with `UnknownError`.
+- **`write_attribute`** takes `*` as the endpoint for a unicast node and writes every endpoint that has the
+  attribute in one Write request; the result has one entry per endpoint the device answered for. The new
+  `timed_request_timeout_ms` (0 to 65535; 0 counts as not given) sends a timed write. A wildcard cluster or
+  attribute stays refused, and so does a malformed path to a node (only digits or `*` per segment, three segments).
+- **`device_command` `timed_request_timeout_ms`** that is not an integer from 0 to 65535 is refused with error 8;
+  before, such a value was ignored and the command was sent without a timed request.
 - **`args`** — every command treats a missing or `null` `args` as no arguments, and refuses a
   non-object `args` with error 8.
 - **`node_id`** — every command that targets a node refuses a `node_id` that can never name one (a
@@ -126,6 +143,37 @@ OHF extensions; python-matter-server codes stop at 11. Each carries JSON details
 ### Node data
 
 - **`endpoint_parents` in node data** (every message that carries node data, for example `get_node`, `start_listening` and `node_updated`). Maps endpoints in `attributes` other than 0 to their direct parent endpoint (JSON keys are strings), `0` for a top-level endpoint. An endpoint whose parent the server does not know has no entry. A test node imported from a dump without the field has none. When the field is absent (server below schema 14, or such a test node), derive the parents from the Descriptor PartsLists as before.
+
+### Error details
+
+- **Optional `status` / `cluster_status` on error responses**: the Matter status the device answered with, when matter.js reports the failure as one: always for a `device_command` the device rejected, not for commands the server sends on its own behalf. `error_code` is unchanged.
+- **Optional `reason` on `NodeCommissionFailed` errors of `commission_with_code` / `commission_on_network`, and on an undecodable pairing code**: `not-discovered`, `passcode-mismatch`, `invalid-payload`, `attestation-rejected`, `timeout` or `other`. A pairing code that cannot be decoded now fails with `InvalidArguments` and `reason: "invalid-payload"` instead of `UnknownError`.
+- **Optional `ClusterStatus` in the `write_attribute` result**, next to `Status`, when the device sent a cluster-specific status.
+
+### Commissioning
+
+- **New command `parse_onboarding_payload`** `{ code }` → `{ type: "qr", payloads: [{ version, vendor_id?, product_id?,
+  flow_type, discovery_capabilities, discriminator, setup_pin_code }] }` or `{ type: "manual",
+  short_discriminator, setup_pin_code, vendor_id?, product_id? }`. Decodes a code as `commission_with_code` does, without
+  contacting a device. An undecodable code fails with `InvalidArguments` and `reason` `invalid-payload`; an unexpected
+  error while decoding fails with `SDKStackError`.
+- **Optional `discovery_timeout_s` on `commission_with_code` and `commission_on_network`**: how long, in seconds, to find the device and set up PASE with it (above 0, at most 172800; `null` counts as not given). Without it matter.js searches for 3 minutes. The commissioning steps after PASE are not limited, and on `commission_on_network` the attempt at `ip_addr` keeps the matter.js PASE limit.
+
+### Subscriptions and generic read
+
+Meant only for the special `--disable-auto-subscription` mode, not for normal operation; the server's own subscription is much more reliable.
+
+- **New command `read`** → `{ attributes, events, attribute_status?, event_status? }`. One Matter Read request with `attribute_paths`, `event_paths` (`[{ path }]`, `path` is `endpoint/cluster/event`), `event_min`, `fabric_filtered` (default `true`) and `data_version_filters` (`[{ path: "endpoint/cluster", data_version }]`). Without `event_min` the request has no event filter and returns all events the device holds. Refused with `InvalidArguments` before anything is sent: an argument of the wrong type, a malformed path or invalid id, no path, `event_min` or `data_version` out of range, `event_min` without `event_paths` and a non-empty `data_version_filters` without `attribute_paths`. `attributes` uses the `read_attribute` shape, `events` the `node_event` shape. `attribute_status` / `event_status` map each path the device answered with a status to `{ status, cluster_status? }` (numeric Matter status codes) and are left out when there is none.
+- **New command `subscribe`** → `{ subscription_id, attributes, events, attribute_status?, event_status? }`: the id and the priming report in the `read` result shape. The `read` arguments plus `min_interval` / `max_interval` (seconds), `is_urgent` per event path and `keep_subscriptions` (default `false`, passed to the device as given; `false`, also when left out, ends all other subscriptions of this controller to the same node, including those of other connections, which arrive as `subscription_ended` at their connections). Only available when the server runs with `--disable-auto-subscription` and the node's auto subscription is off, otherwise `InvalidArguments`. `subscription_id` is the SubscriptionId the device assigned. The `read` refusals apply, and intervals outside 0 to 65535 or `max_interval` below `min_interval` are refused with `InvalidArguments` too. The subscription belongs to the connection that opened it and ends with `unsubscribe`, when that connection closes, when the node is removed or when the server shuts down.
+- **`data_versions`** in the `read` and `subscribe` results and in `subscription_report`: `{ "endpoint/cluster":
+  data_version }` for each cluster with a reported attribute value, left out when there is none. `subscribe` sends only
+  the data version filters the caller gives, as `read` does, so the priming report holds every requested cluster the
+  caller does not filter.
+- **New command `unsubscribe`** (`{ node_id, subscription_id }`) → `null`. Ids are assigned per device, so the node is part of the name. Only available with `--disable-auto-subscription`. A `subscription_id` that is not an integer from 0 to 2^32-1, and a subscription this connection does not hold under that node and id, give `InvalidArguments`.
+- **New commands `enable_auto_subscription` and `disable_auto_subscription`** (`{ node_id }`) → `null`. Switch the server's own subscription to one node on or off. Only available with `--disable-auto-subscription`, otherwise `InvalidArguments`; not kept across a restart. `enable_auto_subscription` returns once the server's subscription is active and fails with `NodeNotResolving` when matter.js finds the device unreachable while waiting, `NodeNotReady` when the subscription is not active within 4 minutes 15 seconds, `NodeNotExists` when the node is removed meanwhile and `UnknownError` when the server shuts down meanwhile, and the node then stays switched on; it fails with `NodeNotReady` when `disable_auto_subscription` switches the node off meanwhile, also during a `resync_icd`, and when a `resync_icd` meanwhile cannot switch the subscription back on. `disable_auto_subscription` returns once the subscription is closed. Enabling ends the node's subscriptions opened with `subscribe` (`subscription_ended`), and `subscribe` for a node with auto subscription on gives `InvalidArguments`.
+- **New event `subscription_report`** → `{ node_id, subscription_id, attributes, events, attribute_status?, event_status? }`. Sent only to the connection that opened the subscription, whether or not it called `start_listening`; it carries the reports after the priming report, which the `subscribe` response carries.
+- **New event `subscription_ended`** → `{ node_id, subscription_id }`. Sent to the owning connection when its subscription ends without `unsubscribe` (node removed, device stopped reporting, another subscription with `keep_subscriptions: false`); not sent for `unsubscribe`, when the connection closes or when the server shuts down (the connections are closed first; `server_shutdown` announces it). Never dropped under backpressure; reports for the id can still arrive after it.
+- **`subscribe_attribute` removed from the client model.** The server never implemented it and answers `InvalidCommand`.
 
 ## Schema 13
 

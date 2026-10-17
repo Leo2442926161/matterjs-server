@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { Bytes } from "@matter/main";
+import { Bytes, NodeId } from "@matter/main";
 import {
     GeneralDiagnostics,
     OccupancySensing,
@@ -13,13 +13,33 @@ import {
     WindowCovering,
 } from "@matter/main/clusters";
 import { AttributeModel, ClusterModel, FieldModel } from "@matter/main/model";
-import { MATTER_EPOCH_OFFSET_US } from "@matter/main/types";
+import {
+    ClusterId,
+    EndpointNumber,
+    EventId,
+    EventNumber,
+    MATTER_EPOCH_OFFSET_US,
+    Status,
+    TlvAny,
+    TlvArray,
+    TlvByteString,
+    TlvField,
+    TlvObject,
+    TlvString,
+    TlvUInt8,
+} from "@matter/main/types";
 import { ClusterMap } from "../src/model/ModelMapper.js";
 import {
+    convertEventToWebSocket,
     convertMatterToWebSocketTagBased,
     convertWebsocketDataToMatter,
     convertWebSocketTagBasedToMatter,
+    pathStatusOf,
+    splitAttributePath,
+    splitEventPath,
+    statusPathOf,
 } from "../src/server/Converters.js";
+import { ServerError, ServerErrorCode } from "../src/types/WebSocketMessageTypes.js";
 
 describe("convertWebSocketTagBasedToMatter", () => {
     const clusterEntry = ClusterMap[Thermostat.Cluster.id];
@@ -337,5 +357,131 @@ describe("convertMatterToWebSocketTagBased - bitmap packing", () => {
         const decoded = convertWebSocketTagBasedToMatter(22, operationalStatus, clusterEntry.model);
 
         expect(convertMatterToWebSocketTagBased(decoded, operationalStatus, clusterEntry.model)).to.equal(22);
+    });
+});
+
+describe("values without a model", () => {
+    const Inner = TlvObject({ text: TlvField(0, TlvString) });
+    const Outer = TlvObject({
+        number: TlvField(1, TlvUInt8),
+        bytes: TlvField(2, TlvByteString),
+        inner: TlvField(3, Inner),
+        list: TlvField(4, TlvArray(Inner)),
+    });
+    const unmodeled = TlvAny.decodeAnyTlvStream(
+        Outer.encodeTlv({ number: 5, bytes: Bytes.fromHex("0102"), inner: { text: "a" }, list: [{ text: "b" }] }),
+    );
+    const tagKeyed = { "1": 5, "2": "AQI=", "3": { "0": "a" }, "4": [{ "0": "b" }] };
+
+    it("sends a structure as tag-keyed JSON", () => {
+        expect(convertMatterToWebSocketTagBased(unmodeled, undefined, undefined)).deep.equals(tagKeyed);
+    });
+
+    it("sends the payload of an unknown event as tag-keyed JSON", () => {
+        const event = convertEventToWebSocket(
+            NodeId(5),
+            { endpointId: EndpointNumber(1), clusterId: ClusterId(0xfff1fc05), eventId: EventId(1) },
+            { eventNumber: EventNumber(1n), priority: 1, data: unmodeled },
+        );
+        expect(event.data).deep.equals(tagKeyed);
+    });
+});
+
+describe("path status helpers", () => {
+    it("keeps a wildcard the device left in the status path", () => {
+        expect(statusPathOf(1, undefined, 3)).equals("1/*/3");
+        expect(statusPathOf(undefined, 6, undefined)).equals("*/6/*");
+    });
+
+    it("adds cluster_status only when the device sent one", () => {
+        expect(pathStatusOf({ status: Status.Failure })).deep.equals({ status: Status.Failure });
+        expect(pathStatusOf({ status: Status.Failure, clusterStatus: 0 })).deep.equals({
+            status: Status.Failure,
+            cluster_status: 0,
+        });
+    });
+});
+
+describe("path splitting", () => {
+    function errorOf(split: () => unknown) {
+        try {
+            split();
+        } catch (error) {
+            return error;
+        }
+        return undefined;
+    }
+
+    it("names the event id when an event path has an invalid one", () => {
+        const error = errorOf(() => splitEventPath("1/59/32768"));
+
+        expect(error).instanceOf(ServerError);
+        if (error instanceof ServerError) {
+            expect(error.code).equals(ServerErrorCode.InvalidArguments);
+            expect(error.message).contains("Invalid event ID");
+            expect(error.message).not.contains("attribute");
+        }
+    });
+
+    it("names the attribute id when an attribute path has an invalid one", () => {
+        const error = errorOf(() => splitAttributePath("1/6/32768"));
+
+        expect(error).instanceOf(ServerError);
+        if (error instanceof ServerError) {
+            expect(error.message).contains("Invalid attribute ID");
+        }
+    });
+
+    it("reads the wildcard values and non-numeric parts as wildcards", () => {
+        expect(splitEventPath("65535/4294967295/4294967295")).deep.equals({
+            endpointId: undefined,
+            clusterId: undefined,
+            eventId: undefined,
+        });
+        expect(splitAttributePath("*/6/*")).deep.equals({
+            endpointId: undefined,
+            clusterId: 6,
+            attributeId: undefined,
+        });
+        expect(splitEventPath("1/59/1")).deep.equals({ endpointId: 1, clusterId: 59, eventId: 1 });
+    });
+});
+
+describe("convertEventToWebSocket", () => {
+    const path = { endpointId: EndpointNumber(1), clusterId: ClusterId(0x45), eventId: EventId(0) };
+    const occurrence = { eventNumber: EventNumber(7n), priority: 1, data: { stateValue: true } };
+
+    it("prefers the epoch timestamp", () => {
+        const event = convertEventToWebSocket(NodeId(5), path, {
+            ...occurrence,
+            epochTimestamp: 1_700_000_000_000,
+            systemTimestamp: 1234,
+        });
+
+        expect(event).deep.equals({
+            node_id: NodeId(5),
+            endpoint_id: 1,
+            cluster_id: 0x45,
+            event_id: 0,
+            event_number: 7n,
+            priority: 1,
+            timestamp: 1_700_000_000_000,
+            timestamp_type: 1,
+            data: { stateValue: true },
+        });
+    });
+
+    it("falls back to the system timestamp, then to the local clock", () => {
+        const system = convertEventToWebSocket(NodeId(5), path, { ...occurrence, systemTimestamp: 1234 });
+        expect([system.timestamp, system.timestamp_type]).deep.equals([1234, 0]);
+
+        const before = Date.now();
+        const local = convertEventToWebSocket(NodeId(5), path, occurrence);
+        expect(local.timestamp_type).equals(2);
+        expect(Number(local.timestamp)).within(before, Date.now());
+    });
+
+    it("sends null for an event without data", () => {
+        expect(convertEventToWebSocket(NodeId(5), path, { ...occurrence, data: undefined }).data).equals(null);
     });
 });

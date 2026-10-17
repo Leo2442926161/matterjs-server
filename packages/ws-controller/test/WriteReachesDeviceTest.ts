@@ -44,7 +44,7 @@ describe("writeAttribute", () => {
         handler = new ControllerCommandHandler(
             {
                 node: controller,
-                fabric,
+                fabricIndex: fabric.fabricIndex,
                 otaProvider: undefined,
                 webRtcRequestor: await controller.add(
                     new Endpoint(CameraControllerEndpoint, { id: "camera-controller" }),
@@ -93,8 +93,8 @@ describe("writeAttribute", () => {
         const first = await writeNodeLabel("Kitchen");
         const second = await writeNodeLabel("Kitchen");
 
-        expect(first.status).equals(Status.Success);
-        expect(second.status).equals(Status.Success);
+        expect(first.map(({ status }) => status)).deep.equals([Status.Success]);
+        expect(second.map(({ status }) => status)).deep.equals([Status.Success]);
         expect(writeRequests).equals(2);
         expect(device.stateOf(BasicInformationServer).nodeLabel).equals("Kitchen");
     });
@@ -113,7 +113,7 @@ describe("writeAttribute", () => {
             { macrotasks: true },
         );
 
-        expect(result.status).equals(Status.UnsupportedWrite);
+        expect(result.map(({ status }) => status)).deep.equals([Status.UnsupportedWrite]);
         expect(writeRequests).equals(1);
     });
 
@@ -122,7 +122,7 @@ describe("writeAttribute", () => {
 
         const result = await writeNodeLabel("x".repeat(33));
 
-        expect(result.status).equals(Status.ConstraintError);
+        expect(result.map(({ status }) => status)).deep.equals([Status.ConstraintError]);
         expect(writeRequests).equals(0);
         expect(device.stateOf(BasicInformationServer).nodeLabel).equals(nodeLabel);
     });
@@ -130,7 +130,7 @@ describe("writeAttribute", () => {
     it("refuses a value of the wrong type without sending it", async () => {
         const result = await writeNodeLabel(42);
 
-        expect(result.status).equals(Status.InvalidDataType);
+        expect(result.map(({ status }) => status)).deep.equals([Status.InvalidDataType]);
         expect(writeRequests).equals(0);
     });
 

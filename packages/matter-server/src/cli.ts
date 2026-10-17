@@ -65,6 +65,8 @@ export interface CliOptions {
     // Certificate configuration
     enableTestNetDcl: boolean;
     disableDclSeed: boolean;
+    dclOffline: boolean;
+    revocationSetsDir: string | null;
 
     // Bluetooth configuration
     bluetoothAdapter: number | null;
@@ -89,6 +91,9 @@ export interface CliOptions {
 
     // Custom cluster polling configuration
     customClusterPollInterval: number;
+
+    // Subscription configuration
+    disableAutoSubscription: boolean;
 }
 
 function parseIntOption(value: string): number {
@@ -179,7 +184,7 @@ export function parseCliArgs(argv?: string[]): CliOptions {
                 .env("STORAGE_PATH"),
         )
         .addOption(
-            new Option("--port <port>", "TCP Port for WebSocket server")
+            new Option("--port <port>", "TCP Port for WebSocket server (0 binds a free port)")
                 .argParser(parseIntOption)
                 .default(DEFAULT_PORT)
                 .env("PORT"),
@@ -227,6 +232,22 @@ export function parseCliArgs(argv?: string[]): CliOptions {
                 .preset(true)
                 .default(false)
                 .env("DISABLE_DCL_SEED"),
+        )
+        .addOption(
+            new Option(
+                "--dcl-offline [value]",
+                "Never contact the DCL for attestation certificates; use only the bundled seed and certificates already stored",
+            )
+                .argParser(parseBooleanEnv)
+                .preset(true)
+                .default(false)
+                .env("DCL_OFFLINE"),
+        )
+        .addOption(
+            new Option(
+                "--revocation-sets-dir <path>",
+                "Directory with device attestation revocation sets (*.json) to install at start",
+            ).env("REVOCATION_SETS_DIR"),
         )
         .addOption(
             new Option("--bluetooth-adapter <id>", "Bluetooth adapter HCI ID (e.g., 0 for hci0)")
@@ -309,6 +330,16 @@ export function parseCliArgs(argv?: string[]): CliOptions {
         )
         .addOption(
             new Option(
+                "--disable-auto-subscription [value]",
+                "Do not subscribe to nodes automatically, neither after commissioning nor on start, and run no polling, time sync, fabric label push or OTA update check, and no Border Router discovery until a client asks for Thread data. You are responsible for subscribing as needed. Only recommended for very special use cases.",
+            )
+                .argParser(parseBooleanEnv)
+                .preset(true)
+                .default(false)
+                .env("DISABLE_AUTO_SUBSCRIPTION"),
+        )
+        .addOption(
+            new Option(
                 "--production-mode [value]",
                 "Force dashboard production mode (auto-connect to server). Use when running behind a reverse proxy.",
             )
@@ -329,6 +360,10 @@ export function parseCliArgs(argv?: string[]): CliOptions {
 
     program.parse(argv);
     const opts = program.opts();
+
+    if (opts.dclOffline && opts.disableDclSeed) {
+        program.error("error: --dcl-offline needs the DCL seed, so it cannot be combined with --disable-dcl-seed");
+    }
 
     // Warn about deprecated options if used
     for (const [key, flag] of Object.entries(DEPRECATED_OPTIONS)) {
@@ -382,6 +417,8 @@ export function parseCliArgs(argv?: string[]): CliOptions {
         defaultFabricLabel: opts.defaultFabricLabel ?? null,
         enableTestNetDcl: opts.enableTestNetDcl,
         disableDclSeed: opts.disableDclSeed,
+        dclOffline: opts.dclOffline,
+        revocationSetsDir: opts.revocationSetsDir ?? null,
         bluetoothAdapter: opts.bluetoothAdapter ?? null,
         bleProxy: opts.bleProxy,
         disableOta: opts.disableOta,
@@ -394,6 +431,7 @@ export function parseCliArgs(argv?: string[]): CliOptions {
         disableThreadDiagnostics: opts.disableThreadDiagnostics,
         threadRestProbePort: opts.threadRestProbePort ?? null,
         customClusterPollInterval: opts.customClusterPollInterval,
+        disableAutoSubscription: opts.disableAutoSubscription,
     };
 }
 

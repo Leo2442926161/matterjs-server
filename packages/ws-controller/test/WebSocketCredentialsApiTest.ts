@@ -6,7 +6,7 @@
 
 import { toBigIntAwareJson } from "@matter-server/ws-client";
 import { AsyncObservable, Environment, Millis, MockStorageService, Observable } from "@matter/general";
-import { CaseAuthenticatedTag, EndpointNumber, NodeId } from "@matter/main";
+import { CaseAuthenticatedTag, EndpointNumber, NodeId, Seconds } from "@matter/main";
 import { WebRtcTransportProvider } from "@matter/main/clusters/web-rtc-transport-provider";
 import { Status, StatusResponseError } from "@matter/main/types";
 import { ThreadCredentialsRegistry } from "@matter/thread-br-client";
@@ -15,6 +15,13 @@ import WebSocket from "ws";
 import type { CameraSessionEnded, CameraStreamEvicted } from "../src/camera/cameraTypes.js";
 import { ConfigStorage } from "../src/server/ConfigStorage.js";
 import { WebSocketControllerHandler } from "../src/server/WebSocketControllerHandler.js";
+import type {
+    AttributeResponseStatus,
+    BatchedInvokeRequest,
+    BatchedInvokeResult,
+    CommissioningRequest,
+    InvokeRequest,
+} from "../src/types/CommandHandler.js";
 
 // Minimal dataset: extPanId = DE:AD:BE:EF:CA:FE:11:22 (a-f bytes exercise the UPPERCASE invariant), network = "OpenThread".
 const DATASET_HEX =
@@ -50,13 +57,15 @@ interface StubCameraStreams {
 
 /** The command-handler behaviour a test needs to vary; everything else is fixed in the stub. */
 interface StubCommandHandlerOverrides {
-    handleInvoke?(): Promise<unknown>;
-    handleWriteAttribute?(data: unknown): Promise<{ status: number }>;
+    handleInvoke?(data: InvokeRequest): Promise<unknown>;
+    handleWriteAttribute?(data: unknown): Promise<AttributeResponseStatus[]>;
+    handleBatchedInvoke?(data: BatchedInvokeRequest): Promise<BatchedInvokeResult>;
     handleGroupWriteAttribute?(data: unknown): Promise<void>;
     handleGroupInvoke?(data: unknown): Promise<void>;
     removeTrackedWebRtcSession?(webRtcSessionId: number, nodeId: bigint, endpointId: number): Promise<void>;
     invokeWebRtcProviderCommand?(args: { commandName: string; fields: Record<string, unknown> }): Promise<unknown>;
     invokeWebRtcSignallingCommand?(args: { commandName: string; fields: Record<string, unknown> }): Promise<void>;
+    commissionNode?(request: CommissioningRequest): Promise<{ nodeId: NodeId }>;
 }
 
 /** Well under the 2000 ms per-test timeout, so a frame that never comes fails as this error. */
@@ -147,16 +156,14 @@ function makeStubController(
 
     const stubCommandHandler = {
         events: stubEvents,
-        handleInvoke:
-            commandHandler?.handleInvoke ??
-            (async () => {
-                return {};
-            }),
+        // matter.js answers a status-only command with undefined.
+        handleInvoke: commandHandler?.handleInvoke ?? (async () => undefined),
         handleWriteAttribute:
             commandHandler?.handleWriteAttribute ??
-            (async () => {
-                return { status: 0 };
-            }),
+            (async () => [{ endpointId: 1, clusterId: 6, attributeId: 0, status: 0 }]),
+        handleBatchedInvoke:
+            commandHandler?.handleBatchedInvoke ??
+            (async (data: BatchedInvokeRequest) => data.commands.map(() => ({ status: Status.Success }))),
         handleGroupWriteAttribute:
             commandHandler?.handleGroupWriteAttribute ??
             (async () => {
@@ -178,6 +185,14 @@ function makeStubController(
             (async () => {
                 throw new Error("no WebRTC provider stubbed");
             }),
+        commissionNode:
+            commandHandler?.commissionNode ??
+            (async () => {
+                throw new Error("no commissioning stubbed");
+            }),
+        isNodeIdInUse() {
+            return false;
+        },
         bleEnabled: false,
         bleProxyEnabled: false,
         async start() {},
@@ -202,8 +217,10 @@ function makeStubController(
 
     const stubDiagnostics = {
         events: { batchUpdated: new Observable() },
+        fetches: 0,
         // Model a disabled / nothing-cached service: single-network fetch yields undefined.
         async getOrFetch() {
+            this.fetches++;
             return undefined;
         },
         listCached() {
@@ -233,6 +250,14 @@ function makeStubController(
     };
 
     return {
+        borderRouterDiscoveryStarts: 0,
+        startsBorderRouterDiscovery: false,
+        startBorderRouterDiscovery() {
+            this.borderRouterDiscoveryStarts++;
+            return this.startsBorderRouterDiscovery;
+        },
+        diagnosticsFetches: () => stubDiagnostics.fetches,
+        async certificateService() {},
         async getAllVendors() {
             return stubVendors;
         },
@@ -279,6 +304,9 @@ interface TestHarness {
     emitDiagnosticsBatch(batch: unknown): void;
     emitWebRtcCallback(data: unknown): void;
     emitTopologyUpdated(topology: unknown): void;
+    borderRouterDiscoveryStarts(): number;
+    discoveryStartsNow(): void;
+    diagnosticsFetches(): number;
     config: ConfigStorage;
     close(): Promise<void>;
 }
@@ -391,6 +419,11 @@ async function createHarness(
         emitDiagnosticsBatch,
         emitWebRtcCallback,
         emitTopologyUpdated,
+        borderRouterDiscoveryStarts: () => controller.borderRouterDiscoveryStarts,
+        discoveryStartsNow: () => {
+            controller.startsBorderRouterDiscovery = true;
+        },
+        diagnosticsFetches: () => controller.diagnosticsFetches(),
         config,
         close,
     };
@@ -527,6 +560,30 @@ describe("WebSocket Credentials API", () => {
         expect(events).to.include("webrtc_callback");
 
         ws.close();
+    });
+
+    it("starts Border Router discovery for the commands that need Border Routers", async () => {
+        await h.handle("get_thread_border_routers", {});
+        await h.handle("get_thread_diagnostics", {});
+        await h.handle("get_thread_diagnostics", { ext_pan_id: "1122334455667788" });
+        await h.handle("get_network_topology", {});
+
+        expect(h.borderRouterDiscoveryStarts()).to.equal(4);
+    });
+
+    it("answers get_thread_diagnostics(ext_pan_id) with null and fetches nothing when that call starts discovery", async () => {
+        h.discoveryStartsNow();
+
+        const res = await h.handle<unknown>("get_thread_diagnostics", { ext_pan_id: "1122334455667788" });
+
+        expect(res).to.equal(null);
+        expect(h.diagnosticsFetches()).to.equal(0);
+    });
+
+    it("fetches diagnostics once Border Router discovery is already running", async () => {
+        await h.handle<unknown>("get_thread_diagnostics", { ext_pan_id: "1122334455667788" });
+
+        expect(h.diagnosticsFetches()).to.equal(1);
     });
 
     it("camera_start_stream opts a connection in to webrtc_callback the same way", async () => {
@@ -974,6 +1031,143 @@ describe("WebSocket Credentials API", () => {
             err = e;
         }
         expect(String(err)).to.contain("unknown");
+    });
+
+    describe("discovery_timeout_s", () => {
+        async function requestsFor(command: string, args: object) {
+            const requests = new Array<CommissioningRequest>();
+            await h.close();
+            h = await createHarness(undefined, {
+                async commissionNode(request) {
+                    requests.push(request);
+                    throw new Error("stop after the request");
+                },
+            });
+            await h.handle(command, args).catch(() => {});
+            return requests;
+        }
+
+        it("bounds the discovery of commission_with_code and commission_on_network", async () => {
+            const [withCode] = await requestsFor("commission_with_code", {
+                code: "MT:Y.K90AFN00KA0648G00",
+                discovery_timeout_s: 90,
+            });
+            const [onNetwork] = await requestsFor("commission_on_network", {
+                setup_pin_code: 20202021,
+                discovery_timeout_s: 90,
+            });
+
+            expect(withCode?.discoveryTimeout).to.equal(Seconds(90));
+            expect(onNetwork?.discoveryTimeout).to.equal(Seconds(90));
+        });
+
+        it("searches commission_on_network filter_type 3 by vendor without naming a product", async () => {
+            const [request] = await requestsFor("commission_on_network", {
+                setup_pin_code: 20202021,
+                filter_type: 3,
+                filter: 0xfff1,
+            });
+
+            expect(request).to.deep.include({ passcode: 20202021, vendorId: 0xfff1 });
+            expect(request).to.not.have.property("productId");
+        });
+
+        it("searches commission_on_network filter_type 4 by device type", async () => {
+            const [request] = await requestsFor("commission_on_network", {
+                setup_pin_code: 20202021,
+                filter_type: 4,
+                filter: 0x0100,
+            });
+
+            expect(request).to.deep.include({ passcode: 20202021, deviceType: 0x0100 });
+        });
+
+        it("refuses commission_on_network filter_type 4 without a filter", async () => {
+            const requests = await requestsFor("commission_on_network", { setup_pin_code: 20202021, filter_type: 4 });
+            const failure = await h.handle("commission_on_network", { setup_pin_code: 20202021, filter_type: 4 }).then(
+                () => "",
+                (error: unknown) => String(error),
+            );
+
+            expect(requests).to.deep.equal([]);
+            expect(failure).to.contain("filter required for filter_type 4");
+        });
+
+        for (const [filterType, field] of [
+            [1, "shortDiscriminator"],
+            [2, "longDiscriminator"],
+            [3, "vendorId"],
+        ] as const) {
+            it(`searches commission_on_network filter_type ${filterType} by ${field} and requires its filter`, async () => {
+                const [request] = await requestsFor("commission_on_network", {
+                    setup_pin_code: 20202021,
+                    filter_type: filterType,
+                    filter: 15,
+                });
+                const failure = await h
+                    .handle("commission_on_network", { setup_pin_code: 20202021, filter_type: filterType })
+                    .then(
+                        () => "",
+                        (error: unknown) => String(error),
+                    );
+
+                expect(request).to.deep.include({ passcode: 20202021, [field]: 15 });
+                expect(failure).to.contain(`filter required for filter_type ${filterType}`);
+            });
+        }
+
+        it("ignores the filter of commission_on_network filter_type 0", async () => {
+            const [request] = await requestsFor("commission_on_network", {
+                setup_pin_code: 20202021,
+                filter_type: 0,
+                filter: 15,
+            });
+
+            expect(request).to.not.have.any.keys("shortDiscriminator", "longDiscriminator", "vendorId", "deviceType");
+        });
+
+        it("accepts 172800 seconds, the longest a device announces for commissioning", async () => {
+            const [request] = await requestsFor("commission_with_code", {
+                code: "MT:Y.K90AFN00KA0648G00",
+                discovery_timeout_s: 172_800,
+            });
+
+            expect(request?.discoveryTimeout).to.equal(Seconds(172_800));
+        });
+
+        for (const value of [undefined, null]) {
+            it(`leaves the matter.js default for ${String(value)}`, async () => {
+                const [request] = await requestsFor("commission_with_code", {
+                    code: "MT:Y.K90AFN00KA0648G00",
+                    discovery_timeout_s: value,
+                });
+
+                expect(request).to.not.equal(undefined);
+                expect(request?.discoveryTimeout).to.equal(undefined);
+            });
+        }
+
+        for (const value of [0, -5, "90", 172_801]) {
+            it(`refuses ${JSON.stringify(value)} before commissioning`, async () => {
+                for (const [command, args] of [
+                    ["commission_with_code", { code: "MT:Y.K90AFN00KA0648G00" }],
+                    ["commission_on_network", { setup_pin_code: 20202021 }],
+                ] as const) {
+                    const requests = await requestsFor(command, { ...args, discovery_timeout_s: value });
+                    expect(requests, command).to.deep.equal([]);
+                }
+                let err: unknown;
+                try {
+                    await h.handle("commission_with_code", {
+                        code: "MT:Y.K90AFN00KA0648G00",
+                        discovery_timeout_s: value,
+                    });
+                } catch (e) {
+                    err = e;
+                }
+                expect(String(err)).to.contain("discovery_timeout_s must be a number of seconds above 0");
+            });
+        }
     });
 
     it("remove_wifi_credentials with id removes that specific entry", async () => {
@@ -2125,7 +2319,7 @@ describe("groupcast on the generic commands", () => {
             },
             handleWriteAttribute: async data => {
                 unicastWrites.push(data);
-                return { status: 0 };
+                return [];
             },
         });
         try {
@@ -2189,7 +2383,7 @@ describe("groupcast on the generic commands", () => {
                     `group-write-wildcard-${label}`,
                 );
                 expect(answer.error_code).to.equal(8);
-                expect(answer.details).to.contain("wildcards");
+                expect(answer.details).to.contain("wildcard");
             } finally {
                 await h.close();
             }
@@ -2234,6 +2428,122 @@ describe("groupcast on the generic commands", () => {
         }
     });
 
+    it("passes timed_request_timeout_ms and interaction_timeout_ms of a device_command to handleInvoke", async () => {
+        const invokes = new Array<InvokeRequest>();
+        const h = await createHarness(undefined, {
+            handleInvoke: async data => {
+                invokes.push(data);
+                return undefined;
+            },
+        });
+        try {
+            const answer = await answerFor(
+                h,
+                "device_command",
+                {
+                    node_id: 1,
+                    endpoint_id: 1,
+                    cluster_id: 6,
+                    command_name: "toggle",
+                    payload: {},
+                    timed_request_timeout_ms: 1000,
+                    interaction_timeout_ms: 5000,
+                },
+                "unicast-invoke-timeouts",
+            );
+            expect(answer.error_code).to.equal(undefined);
+            expect(
+                invokes.map(({ timedInteractionTimeoutMs, interactionTimeoutMs }) => ({
+                    timedInteractionTimeoutMs,
+                    interactionTimeoutMs,
+                })),
+            ).deep.equals([{ timedInteractionTimeoutMs: Millis(1000), interactionTimeoutMs: Millis(5000) }]);
+        } finally {
+            await h.close();
+        }
+    });
+
+    for (const [name, stated, expected] of [
+        // As in python-matter-server, 0 means no timed request.
+        ["timed_request_timeout_ms", 0, undefined],
+        ["timed_request_timeout_ms", 65_535, Millis(65_535)],
+        ["timed_request_timeout_ms", null, undefined],
+        ["interaction_timeout_ms", 0, Millis(0)],
+        ["interaction_timeout_ms", Number.MAX_SAFE_INTEGER, Millis(Number.MAX_SAFE_INTEGER)],
+        ["interaction_timeout_ms", null, undefined],
+    ] as const) {
+        it(`passes ${name} ${String(stated)} of a device_command on`, async () => {
+            const invokes = new Array<InvokeRequest>();
+            const h = await createHarness(undefined, {
+                handleInvoke: async data => {
+                    invokes.push(data);
+                    return undefined;
+                },
+            });
+            try {
+                const answer = await answerFor(
+                    h,
+                    "device_command",
+                    {
+                        node_id: 1,
+                        endpoint_id: 1,
+                        cluster_id: 6,
+                        command_name: "toggle",
+                        payload: {},
+                        [name]: stated,
+                    },
+                    `unicast-invoke-${name}-bound-${String(stated)}`,
+                );
+                expect(answer.error_code).to.equal(undefined);
+                expect(
+                    invokes.map(({ timedInteractionTimeoutMs, interactionTimeoutMs }) =>
+                        name === "timed_request_timeout_ms" ? timedInteractionTimeoutMs : interactionTimeoutMs,
+                    ),
+                ).deep.equals([expected]);
+            } finally {
+                await h.close();
+            }
+        });
+    }
+
+    for (const [name, stated] of [
+        ["timed_request_timeout_ms", -1],
+        ["timed_request_timeout_ms", 1.5],
+        ["timed_request_timeout_ms", "1000"],
+        ["timed_request_timeout_ms", 65_536],
+        ["interaction_timeout_ms", -1],
+        ["interaction_timeout_ms", 1.5],
+        ["interaction_timeout_ms", "5000"],
+        ["interaction_timeout_ms", Number.MAX_SAFE_INTEGER + 1],
+    ] as const) {
+        it(`refuses ${name} ${JSON.stringify(stated)} on a device_command`, async () => {
+            const h = await createHarness(undefined, {
+                handleInvoke: async () => {
+                    throw new Error("invoke must not be reached");
+                },
+            });
+            try {
+                const answer = await answerFor(
+                    h,
+                    "device_command",
+                    {
+                        node_id: 1,
+                        endpoint_id: 1,
+                        cluster_id: 6,
+                        command_name: "toggle",
+                        payload: {},
+                        [name]: stated,
+                    },
+                    `unicast-invoke-${name}-${String(stated)}`,
+                );
+                expect(answer.error_code).to.equal(8);
+                expect(answer.details).to.contain(name);
+            } finally {
+                await h.close();
+            }
+        });
+    }
+
     // A wrong-type timeout converts to `undefined`, so the check must read the stated value.
     for (const [name, stated] of [
         ["timed_request_timeout_ms", 1000],
@@ -2269,9 +2579,7 @@ describe("groupcast on the generic commands", () => {
 
     it("answers a unicast write_attribute with the node's own status", async () => {
         const h = await createHarness(undefined, {
-            handleWriteAttribute: async () => {
-                return { status: 0x86 };
-            },
+            handleWriteAttribute: async () => [{ endpointId: 1, clusterId: 6, attributeId: 16385, status: 0x86 }],
         });
         try {
             const answer = await answerFor(
@@ -2288,6 +2596,318 @@ describe("groupcast on the generic commands", () => {
             await h.close();
         }
     });
+
+    it("passes a wildcard endpoint of a unicast write_attribute on and answers per endpoint", async () => {
+        const writes = new Array<unknown>();
+        const h = await createHarness(undefined, {
+            handleWriteAttribute: async data => {
+                writes.push(data);
+                return [
+                    { endpointId: 1, clusterId: 6, attributeId: 16385, status: 0 },
+                    { endpointId: 2, clusterId: 6, attributeId: 16385, status: 0x88 },
+                ];
+            },
+        });
+        try {
+            const answer = await answerFor(
+                h,
+                "write_attribute",
+                { node_id: 1, attribute_path: "*/6/16385", value: 5 },
+                "unicast-write-wildcard-endpoint",
+            );
+            expect(answer.error_code).to.equal(undefined);
+            expect(answer.result).to.deep.equal([
+                { Path: { EndpointId: 1, ClusterId: 6, AttributeId: 16385 }, Status: 0 },
+                { Path: { EndpointId: 2, ClusterId: 6, AttributeId: 16385 }, Status: 0x88 },
+            ]);
+            expect(writes).to.have.length(1);
+            expect(writes[0]).to.have.property("endpointId", undefined);
+        } finally {
+            await h.close();
+        }
+    });
+
+    for (const path of ["*/6/16385", "65535/6/16385"]) {
+        it(`takes ${path} as a wildcard endpoint of a unicast write_attribute`, async () => {
+            const writes = new Array<unknown>();
+            const h = await createHarness(undefined, {
+                handleWriteAttribute: async data => {
+                    writes.push(data);
+                    return [];
+                },
+            });
+            try {
+                const answer = await answerFor(
+                    h,
+                    "write_attribute",
+                    { node_id: 1, attribute_path: path, value: 5 },
+                    `unicast-write-wildcard-${path}`,
+                );
+                expect(answer.error_code).to.equal(undefined);
+                expect(writes).to.have.length(1);
+                expect(writes[0]).to.have.property("endpointId", undefined);
+            } finally {
+                await h.close();
+            }
+        });
+    }
+
+    for (const path of ["1x/6/16385", "null/6/16385", "None/6/16385", "/6/16385", "1/6/16385/x"]) {
+        it(`refuses a unicast write_attribute with the malformed path ${JSON.stringify(path)}`, async () => {
+            const h = await createHarness(undefined, {
+                handleWriteAttribute: async () => {
+                    throw new Error("write must not be reached");
+                },
+            });
+            try {
+                const answer = await answerFor(
+                    h,
+                    "write_attribute",
+                    { node_id: 1, attribute_path: path, value: 5 },
+                    `unicast-write-malformed-${path}`,
+                );
+                expect(answer.error_code).to.equal(8);
+                expect(answer.details).to.contain("attribute_path");
+            } finally {
+                await h.close();
+            }
+        });
+    }
+
+    for (const path of ["1/*/16385", "1/6/*"]) {
+        it(`refuses a unicast write_attribute with a wildcard in ${path}`, async () => {
+            const h = await createHarness(undefined, {
+                handleWriteAttribute: async () => {
+                    throw new Error("write must not be reached");
+                },
+            });
+            try {
+                const answer = await answerFor(
+                    h,
+                    "write_attribute",
+                    { node_id: 1, attribute_path: path, value: 5 },
+                    `unicast-write-wildcard-${path}`,
+                );
+                expect(answer.error_code).to.equal(8);
+                expect(answer.details).to.contain("wildcard");
+            } finally {
+                await h.close();
+            }
+        });
+    }
+
+    for (const [stated, expected] of [
+        [0, undefined],
+        [65_535, Millis(65_535)],
+        [null, undefined],
+    ] as const) {
+        it(`passes timed_request_timeout_ms ${String(stated)} of a write_attribute on`, async () => {
+            const writes = new Array<unknown>();
+            const h = await createHarness(undefined, {
+                handleWriteAttribute: async data => {
+                    writes.push(data);
+                    return [{ endpointId: 1, clusterId: 6, attributeId: 16385, status: 0 }];
+                },
+            });
+            try {
+                const answer = await answerFor(
+                    h,
+                    "write_attribute",
+                    { node_id: 1, attribute_path: "1/6/16385", value: 5, timed_request_timeout_ms: stated },
+                    `unicast-write-timed-${String(stated)}`,
+                );
+                expect(answer.error_code).to.equal(undefined);
+                expect(writes).to.have.length(1);
+                expect(writes[0]).to.have.property("timedInteractionTimeoutMs", expected);
+            } finally {
+                await h.close();
+            }
+        });
+    }
+
+    for (const stated of [-1, 1.5, "1000", 65_536]) {
+        it(`refuses timed_request_timeout_ms ${JSON.stringify(stated)} on a write_attribute`, async () => {
+            const h = await createHarness(undefined, {
+                handleWriteAttribute: async () => {
+                    throw new Error("write must not be reached");
+                },
+            });
+            try {
+                const answer = await answerFor(
+                    h,
+                    "write_attribute",
+                    { node_id: 1, attribute_path: "1/6/16385", value: 5, timed_request_timeout_ms: stated },
+                    `unicast-write-timed-bad-${String(stated)}`,
+                );
+                expect(answer.error_code).to.equal(8);
+                expect(answer.details).to.contain("timed_request_timeout_ms");
+            } finally {
+                await h.close();
+            }
+        });
+    }
+
+    it("refuses timed_request_timeout_ms on a groupcast write_attribute", async () => {
+        const h = await createHarness(undefined, {
+            handleGroupWriteAttribute: async () => {
+                throw new Error("groupcast must not be reached");
+            },
+        });
+        try {
+            const answer = await answerFor(
+                h,
+                "write_attribute",
+                { node_id: GROUP_NODE_ID, attribute_path: "*/6/16385", value: 5, timed_request_timeout_ms: 1000 },
+                "group-write-timed",
+            );
+            expect(answer.error_code).to.equal(8);
+            expect(answer.details).to.contain("timed_request_timeout_ms");
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("passes batched_device_commands on in order and answers each command", async () => {
+        const batches = new Array<BatchedInvokeRequest>();
+        const h = await createHarness(undefined, {
+            handleBatchedInvoke: async data => {
+                batches.push(data);
+                return [{ status: Status.Success }, { status: Status.Failure, clusterStatus: 3 }];
+            },
+        });
+        try {
+            const answer = await answerFor(
+                h,
+                "batched_device_commands",
+                {
+                    node_id: 1,
+                    commands: [
+                        { endpoint_id: 1, cluster_id: 6, command_name: "On", payload: {} },
+                        { endpoint_id: 2, cluster_id: 6, command_name: "Toggle" },
+                    ],
+                    timed_request_timeout_ms: 500,
+                    interaction_timeout_ms: 3000,
+                },
+                "batched",
+            );
+            await answerFor(
+                h,
+                "batched_device_commands",
+                {
+                    node_id: 1,
+                    commands: [{ endpoint_id: 1, cluster_id: 6, command_name: "On" }],
+                    timed_request_timeout_ms: 0,
+                },
+                "batched-untimed",
+            );
+            expect(answer.error_code).to.equal(undefined);
+            expect(answer.result).to.deep.equal([{ status: 0 }, { status: Status.Failure, cluster_status: 3 }]);
+            expect(
+                batches.map(({ commands, timedInteractionTimeoutMs, interactionTimeoutMs }) => ({
+                    commands: commands.map(({ endpointId, clusterId, commandName, data }) => ({
+                        endpointId,
+                        clusterId,
+                        commandName,
+                        data,
+                    })),
+                    timedInteractionTimeoutMs,
+                    interactionTimeoutMs,
+                })),
+            ).to.deep.equal([
+                {
+                    commands: [
+                        { endpointId: 1, clusterId: 6, commandName: "On", data: {} },
+                        { endpointId: 2, clusterId: 6, commandName: "Toggle", data: {} },
+                    ],
+                    timedInteractionTimeoutMs: Millis(500),
+                    interactionTimeoutMs: Millis(3000),
+                },
+                {
+                    commands: [{ endpointId: 1, clusterId: 6, commandName: "On", data: {} }],
+                    timedInteractionTimeoutMs: undefined,
+                    interactionTimeoutMs: undefined,
+                },
+            ]);
+        } finally {
+            await h.close();
+        }
+    });
+
+    it("converts the response payload of a batched command like device_command", async () => {
+        const h = await createHarness(undefined, {
+            handleBatchedInvoke: async () => [{ status: Status.Success, data: { errorCode: 0, debugText: "ok" } }],
+        });
+        try {
+            const answer = await answerFor(
+                h,
+                "batched_device_commands",
+                {
+                    node_id: 1,
+                    commands: [
+                        {
+                            endpoint_id: 0,
+                            cluster_id: 0x30,
+                            command_name: "ArmFailSafe",
+                            payload: { expiryLengthSeconds: 60, breadcrumb: 0 },
+                        },
+                    ],
+                },
+                "batched-response",
+            );
+            expect(answer.result).to.deep.equal([{ status: 0, response: { errorCode: 0, debugText: "ok" } }]);
+        } finally {
+            await h.close();
+        }
+    });
+
+    for (const [label, args] of [
+        ["an empty commands list", { node_id: 1, commands: [] }],
+        ["a missing commands list", { node_id: 1 }],
+        ["a command that is not an object", { node_id: 1, commands: [5] }],
+        ["a command without command_name", { node_id: 1, commands: [{ endpoint_id: 1, cluster_id: 6 }] }],
+        [
+            "an endpoint_id of the wrong type",
+            { node_id: 1, commands: [{ endpoint_id: "1", cluster_id: 6, command_name: "On" }] },
+        ],
+        [
+            "an invalid timed_request_timeout_ms",
+            {
+                node_id: 1,
+                commands: [{ endpoint_id: 1, cluster_id: 6, command_name: "On" }],
+                timed_request_timeout_ms: 65_536,
+            },
+        ],
+        [
+            "an invalid interaction_timeout_ms",
+            {
+                node_id: 1,
+                commands: [{ endpoint_id: 1, cluster_id: 6, command_name: "On" }],
+                interaction_timeout_ms: -1,
+            },
+        ],
+        [
+            "a group node id",
+            { node_id: GROUP_NODE_ID, commands: [{ endpoint_id: 1, cluster_id: 6, command_name: "On" }] },
+        ],
+        [
+            "a WebRTC Transport Provider command",
+            { node_id: 1, commands: [{ endpoint_id: 1, cluster_id: 0x553, command_name: "EndSession", payload: {} }] },
+        ],
+    ] as const) {
+        it(`refuses batched_device_commands with ${label}`, async () => {
+            const h = await createHarness(undefined, {
+                handleBatchedInvoke: async () => {
+                    throw new Error("batch must not be reached");
+                },
+            });
+            try {
+                const answer = await answerFor(h, "batched_device_commands", { ...args }, `batched-bad-${label}`);
+                expect(answer.error_code).to.equal(8);
+            } finally {
+                await h.close();
+            }
+        });
+    }
 
     it("routes device_command for a group node id to the groupcast path and answers null", async () => {
         const groupInvokes = new Array<Record<string, unknown>>();

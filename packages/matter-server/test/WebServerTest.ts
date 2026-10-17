@@ -5,13 +5,32 @@
  */
 
 import type { HttpServer, WebServerHandler } from "@matter-server/ws-controller";
+import { Logger, LogLevel } from "@matter/main";
 import { spawn } from "node:child_process";
 import { chmod, lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { request as httpRequest } from "node:http";
+import { get as httpGet, request as httpRequest } from "node:http";
 import { connect, createServer as createNetServer, type Server as NetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebServer } from "../src/server/WebServer.js";
+
+async function logsOf(facility: string, run: () => Promise<void>) {
+    const logged = new Array<{ level: LogLevel; text: string }>();
+    const destination = Logger.destinations.default;
+    const add = destination.add.bind(destination);
+    destination.add = message => {
+        if (message.facility === facility) {
+            logged.push({ level: message.level, text: message.values.join(" ") });
+        }
+        add(message);
+    };
+    try {
+        await run();
+    } finally {
+        destination.add = add;
+    }
+    return logged;
+}
 
 class OkHandler implements WebServerHandler {
     async register(server: HttpServer) {
@@ -145,5 +164,59 @@ describe("WebServer", () => {
 
         await expect(createWebServer().start()).to.be.rejectedWith(/EADDRINUSE/);
         expect(await readFile(socketPath, "utf8")).to.equal("keep me");
+    });
+
+    describe("port 0", () => {
+        function getOverTcp(host: string, port: number): Promise<string> {
+            return new Promise((resolve, reject) => {
+                httpGet({ host, port, path: "/", agent: false }, res => {
+                    let body = "";
+                    res.setEncoding("utf8");
+                    res.on("data", chunk => (body += chunk));
+                    res.on("end", () => resolve(body));
+                }).on("error", reject);
+            });
+        }
+
+        async function ipv6LoopbackAvailable() {
+            const probe = createNetServer();
+            try {
+                await new Promise<void>((resolve, reject) => {
+                    probe.once("error", reject);
+                    probe.listen(0, "::1", resolve);
+                });
+                return true;
+            } catch {
+                return false;
+            } finally {
+                await new Promise<void>(resolve => probe.close(() => resolve()));
+            }
+        }
+
+        it("binds a free port and reports it", async () => {
+            const server = new WebServer({ listenAddresses: ["127.0.0.1"], port: 0 }, [new OkHandler()]);
+            webServer = server;
+            const logged = await logsOf("WebServer", () => server.start());
+
+            expect(server.port).to.be.greaterThan(0);
+            expect(await getOverTcp("127.0.0.1", server.port)).to.equal("ok");
+            // The readiness line is a documented contract, see docs/cli.md.
+            expect(logged).to.deep.include({
+                level: LogLevel.NOTICE,
+                text: `Webserver listening on http://127.0.0.1:${server.port}`,
+            });
+        });
+
+        it("uses the same port for every TCP listener", async function () {
+            if (!(await ipv6LoopbackAvailable())) {
+                this.skip();
+            }
+            webServer = new WebServer({ listenAddresses: ["127.0.0.1", "::1"], port: 0 }, [new OkHandler()]);
+            await webServer.start();
+
+            expect(webServer.port).to.be.greaterThan(0);
+            expect(await getOverTcp("127.0.0.1", webServer.port)).to.equal("ok");
+            expect(await getOverTcp("::1", webServer.port)).to.equal("ok");
+        });
     });
 });

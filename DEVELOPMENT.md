@@ -95,6 +95,10 @@ npm run send-command -- ws://localhost:5580/ws device_command '{"node_id": 1, "e
 
 The script connects to the server, sends the command, and keeps the connection open to log all incoming messages (results and events). Press `Ctrl+C` to disconnect.
 
+## Certification tests
+
+See [cert/README.md](cert/README.md).
+
 ## Websocket commands
 
 [Websocket documentation](/docs/websockets_api.md)

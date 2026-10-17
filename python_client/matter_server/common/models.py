@@ -28,6 +28,8 @@ class EventType(Enum):
     NETWORK_TOPOLOGY_UPDATED = "network_topology_updated"  # schema 13+
     CAMERA_SESSION_ENDED = "camera_session_ended"  # schema 14+
     CAMERA_STREAM_EVICTED = "camera_stream_evicted"  # schema 14+
+    SUBSCRIPTION_REPORT = "subscription_report"  # schema 14+
+    SUBSCRIPTION_ENDED = "subscription_ended"  # schema 14+
 
 
 class APICommand(str, Enum):
@@ -48,6 +50,7 @@ class APICommand(str, Enum):
     DISCOVER = "discover"
     INTERVIEW_NODE = "interview_node"
     DEVICE_COMMAND = "device_command"
+    BATCHED_DEVICE_COMMANDS = "batched_device_commands"  # schema 14+
     REMOVE_NODE = "remove_node"
     GET_VENDOR_NAMES = "get_vendor_names"
     READ_ATTRIBUTE = "read_attribute"
@@ -78,6 +81,12 @@ class APICommand(str, Enum):
     CAMERA_STOP_STREAM = "camera_stop_stream"  # schema 14+
     CAMERA_SNAPSHOT = "camera_snapshot"  # schema 14+
     CAMERA_RELEASE_STREAM = "camera_release_stream"  # schema 14+
+    READ = "read"  # schema 14+
+    SUBSCRIBE = "subscribe"  # schema 14+
+    UNSUBSCRIBE = "unsubscribe"  # schema 14+
+    ENABLE_AUTO_SUBSCRIPTION = "enable_auto_subscription"  # schema 14+
+    DISABLE_AUTO_SUBSCRIPTION = "disable_auto_subscription"  # schema 14+
+    PARSE_ONBOARDING_PAYLOAD = "parse_onboarding_payload"  # schema 14+
 
 
 EventCallBackType = Callable[[EventType, Any], None]
@@ -208,6 +217,9 @@ class ErrorResultMessage(ResultMessageBase):
 
     error_code: int
     details: str | None = None
+    status: int | None = None
+    cluster_status: int | None = None
+    reason: str | None = None
 
 
 @dataclass
@@ -796,3 +808,120 @@ class CameraOccupyingStream:
     kind: str
     stream_id: int
     reference_count: int
+
+
+class EventPath(TypedDict):
+    """Event path of a `read`: "endpoint/cluster/event", wildcards allowed."""
+
+    path: str
+
+
+class SubscribeEventPath(EventPath, total=False):
+    """Event path of a `subscribe`; `is_urgent` is the IsUrgent flag of that path."""
+
+    is_urgent: bool
+
+
+class DataVersionFilter(TypedDict):
+    """Skip a cluster whose data version is still `data_version`; `path` is "endpoint/cluster", both concrete."""
+
+    path: str
+    data_version: int
+
+
+@dataclass
+class PathStatus:
+    """Matter status the device returned for one path; `cluster_status` is the cluster-specific one."""
+
+    status: int
+    cluster_status: int | None = None
+
+
+@dataclass
+class InteractionReport:
+    """Result of `read`, and the shape of every report of a subscription.
+
+    `attributes` is keyed by attribute path as in `read_attribute`. The status maps are keyed by the
+    path in the request format and are `None` when the device returned no status. `data_versions`
+    holds the data version of each cluster with a reported attribute value, keyed by
+    `endpoint/cluster`.
+    """
+
+    attributes: dict[str, Any]
+    events: list[MatterNodeEvent]
+    attribute_status: dict[str, PathStatus] | None = None
+    event_status: dict[str, PathStatus] | None = None
+    data_versions: dict[str, int] | None = None
+
+
+@dataclass(kw_only=True)
+class SubscribeResult(InteractionReport):
+    """Result of `subscribe`: the priming report plus the id the device assigned.
+
+    A subscription id is unique only per node; name a subscription by `node_id` and `subscription_id`.
+    """
+
+    subscription_id: int
+
+
+@dataclass(kw_only=True)
+class SubscriptionReportData(InteractionReport):
+    """Payload of the `subscription_report` event."""
+
+    node_id: int
+    subscription_id: int
+
+
+@dataclass
+class SubscriptionEndedData:
+    """Payload of the `subscription_ended` event."""
+
+    node_id: int
+    subscription_id: int
+
+
+SubscriptionListener = Callable[[EventType, SubscriptionReportData | SubscriptionEndedData], None]
+
+
+@dataclass
+class BatchedCommandResult:
+    """The device's answer to one command of `batched_device_commands`; `status` 0 is success."""
+
+    status: int
+    cluster_status: int | None = None
+    response: Any = None
+
+
+@dataclass
+class QrOnboardingPayload:
+    """One payload of a QR code; `vendor_id`/`product_id` are None where the payload says 0."""
+
+    version: int
+    flow_type: int
+    discovery_capabilities: int
+    discriminator: int
+    setup_pin_code: int
+    vendor_id: int | None = None
+    product_id: int | None = None
+
+
+@dataclass
+class QrOnboardingPayloadResult:
+    """Result of `parse_onboarding_payload` for a QR code: one entry per payload it carries."""
+
+    type: str
+    payloads: list[QrOnboardingPayload]
+
+
+@dataclass
+class ManualOnboardingPayloadResult:
+    """Result of `parse_onboarding_payload` for a manual pairing code.
+
+    `vendor_id`/`product_id` are set only by the 21-digit form, and are None where it says 0.
+    """
+
+    type: str
+    short_discriminator: int
+    setup_pin_code: int
+    vendor_id: int | None = None
+    product_id: int | None = None

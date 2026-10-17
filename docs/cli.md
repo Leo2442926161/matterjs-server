@@ -27,7 +27,7 @@ npm run server -- --bluetooth-adapter 0
 | --vendorid                   | integer      | 0xFFF1 (65521)   | No       | Vendor ID for the Fabric                                                                                                                                                                                                                                             |
 | --fabricid                   | integer      | (random)         | No       | Fabric ID for the Fabric (random if not specified)                                                                                                                                                                                                                   |
 | --storage-path               | string       | ~/.matter_server | No       | Storage path to keep persistent data                                                                                                                                                                                                                                 |
-| --port                       | integer      | 5580             | No       | TCP Port for WebSocket server                                                                                                                                                                                                                                        |
+| --port                       | integer      | 5580             | No       | TCP Port for WebSocket server. `0` binds a free port chosen by the OS (shared by all `--listen-address` TCP listeners); the bound port is in the `Webserver listening on …` log line                                                                                |
 | --listen-address             | string[]     | null (bind all)  | No       | IP address(es), interface name(s) or absolute unix socket path(s) to bind WebSocket server. Repeatable — env `LISTEN_ADDRESS` (comma-separated).                                                                                                                                                                                                                 |
 | --log-level                  | enum         | "info"           | No       | Global logging level                                                                                                                                                                                                                                                 |
 | --log-file                   | string       | null             | No       | Log file path incl. filename, e.g. `/data/matter-server.log`                                                                                                                                                                                                         |
@@ -35,6 +35,8 @@ npm run server -- --bluetooth-adapter 0
 | --default-fabric-label       | string       | null             | No       | Pin the fabric label to this value and ignore `set_default_fabric_label` WebSocket requests — env `DEFAULT_FABRIC_LABEL`. Prevents multiple clients from overwriting each other's label.                                                                             |
 | --enable-test-net-dcl        | boolean flag | false            | No       | Enable test-net DCL to check for certificates and OTA-updates additionally to the production DCL                                                                                                                                                                     |
 | --disable-dcl-seed           | boolean flag | false            | No       | Disable bundled offline DCL seed (PAA roots, CD signers, vendors); rely on network DCL only                                                                                                                                                                          |
+| --dcl-offline                | boolean flag | false            | No       | Never contact the DCL: attestation trusts the bundled DCL seed (PAA roots, CD signers) and certificates stored by earlier runs and skips DCL revocation checks (sets from `--revocation-sets-dir` still apply), vendor names come from the seed and storage, and OTA update checks do not query the DCL. Cannot be combined with `--disable-dcl-seed` |
+| --revocation-sets-dir        | string       | null             | No       | Directory with device attestation revocation sets, installed at every start before commissioning is possible — env `REVOCATION_SETS_DIR`. Reads every `*.json` file: a JSON array of entries as CHIP's `credentials/generate_revocation_set.py` writes them (`issuer_subject_key_id` hex, `issuer_name` base64 DER, `revoked_serial_numbers` hex list; `crl_signer_cert` and `crl_signer_delegator` are ignored). An invalid file is skipped with an error. Works with and without `--dcl-offline`. See [Installing Device Attestation Revocation Sets](../README.md#installing-device-attestation-revocation-sets) |
 | --bluetooth-adapter          | integer      | null             | No       | Bluetooth adapter HCI ID (e.g., 0 for hci0). Mutually exclusive with `--ble-proxy`.                                                                                                                                                                                  |
 | --ble-proxy                  | boolean flag | false            | No       | Expose `/ble` WebSocket endpoint for a remote BLE proxy client. Mutually exclusive with `--bluetooth-adapter` (--ble-proxy wins).                                                                                                                                    |
 | --disable-ota                | boolean flag | false            | No       | Disable OTA update functionality                                                                                                                                                                                                                                     |
@@ -47,6 +49,7 @@ npm run server -- --bluetooth-adapter 0
 | --thread-rest-probe-port     | integer      | 8081             | No       | TCP port of the OTBR REST API probed on discovered Thread Border Routers — env `THREAD_REST_PROBE_PORT`. Set it when the Border Router exposes its REST API on another port (e.g. `8080`). A wrong port costs probe time on every discovered Border Router before the probe gives up and the network falls back to CoAP. |
 | --enable-time-sync           | boolean flag | false            | No       | Enables automatic time synchronization for devices that support it (env `ENABLE_TIME_SYNC`). Only enable when the host clock is reliably synced (e.g., NTP); pushes UTC time + time zone / DST.                                                                      |
 | --custom-cluster-poll-interval | integer    | 60               | No       | Interval in seconds for polling custom cluster attributes that do not support Matter subscriptions (legacy Eve Energy devices) — env `CUSTOM_CLUSTER_POLL_INTERVAL`. Accepts 60 to 86400; raise it (e.g. `300`, `600`) to cut periodic Thread traffic on networks with many such devices, at the cost of less current energy readings. |
+| --disable-auto-subscription  | boolean flag | false            | No       | Do not subscribe to nodes automatically, neither after commissioning nor on start, and stop the subscriptions of already commissioned nodes — env `DISABLE_AUTO_SUBSCRIPTION`. You are responsible for subscribing as needed (WebSocket `subscribe`/`unsubscribe` and the per-node `enable_auto_subscription`/`disable_auto_subscription` are only available with it); only recommended for very special use cases. See [Disabled auto subscription](#disabled-auto-subscription). |
 
 > **Log rotation:** `--log-file` must be a full file path including the filename. The log is rotated
 > every 24 hours, and on each startup: backups are shifted (`.6`→`.7`, …, `.1`→`.2`, current→`.1`),
@@ -59,6 +62,63 @@ npm run server -- --bluetooth-adapter 0
 > (e.g. `--listen-address 127.0.0.1` for localhost-only), and use `--primary-interface` to control
 > which interface Matter mDNS announcements and communication use (e.g. `--primary-interface eth0`).
 > Additionally consider firewall rules, VPN, or reverse-proxy authentication in front of the server.
+
+### Disabled auto subscription
+
+With `--disable-auto-subscription` the server never sends a Subscribe request on its own. Commissioning still
+reads the full node once, so `commission_with_code` / `commission_on_network` return a complete node, and
+`interview_node` still performs a full read. Otherwise node data only changes through the reads you issue. What
+a fabric-filtered read such as `interview_node` returns is applied to the node, so `get_node` and
+`attribute_updated` events reflect it, including endpoints the read discovered.
+
+The WebSocket commands `subscribe`, `unsubscribe`, `enable_auto_subscription` and `disable_auto_subscription` are
+only available with this setting; `read` works in both modes. `enable_auto_subscription` switches the server's own
+subscription to one node on until the next start and returns once that subscription is active, so reports,
+connection state and `register_icd` work for that node as without this setting; `subscribe` is then refused for
+that node.
+
+Without the server's own subscription matter.js never reports a node as connected; a subscription a client opens
+with `subscribe` does not change that. Such a node stays `available` unless the server finds it unreachable.
+`remove_node` always tries to tell the device to remove the fabric, also for a node switched on with
+`enable_auto_subscription`, and removes the node only locally when that fails, so removing an unreachable node
+takes the full discovery and retry time before it returns. The server's background jobs stay off for all nodes,
+also for those switched on with `enable_auto_subscription`:
+
+- fabric label changes are not pushed to the device; matter.js itself still updates a stale label once when the
+  server's subscription to a node first comes up
+- time synchronization, custom cluster polling and the Thread neighbor/route refresh do not run
+- the OTA provider does not check the DCL for updates on its own (otherwise 5 to 10 minutes after the start and
+  then every 24 hours); matter.js only offers updates to nodes with the server's own subscription, so for other nodes
+  `check_node_update` returns `null` and `update_node` fails, unless an update was found while the node was still
+  subscribed. Stored OTA files that no node needs anymore are not deleted either, because that cleanup runs with the
+  update check.
+- Thread Border Routers are not discovered and probed for a REST API until a client sends
+  `get_thread_border_routers`, `get_thread_diagnostics` or `get_network_topology`; from then on discovery keeps
+  running and every newly found Border Router is probed
+
+Devices can still contact the server on their own, for example to ask the OTA provider for an update.
+
+For a node without the server's own subscription:
+
+- `register_icd` fails, because matter.js only registers while the server's own subscription is active
+- `resync_icd` only drops the local ICD registration; a LIT device re-registers only once the server's own
+  subscription is active again, through `enable_auto_subscription` or with the setting turned off
+
+The setting is applied to every stored node on each start, which also switches off every node enabled with
+`enable_auto_subscription`. Starting again without it restores the automatic subscriptions.
+
+### Readiness line
+
+Each TCP or unix socket listener logs one line once it accepts WebSocket connections on `/ws`:
+
+```
+Webserver listening on http://<host>:<port>
+Webserver listening on unix socket <path>
+```
+
+`<port>` is the bound port, also with `--port 0`. Tools may wait for this line and read the port from the text after
+the last `:` (IPv6 hosts are not bracketed). Its wording is a contract: a change to it is a breaking change. The line
+is logged at level `notice`, so a tool waiting for it needs `--log-level` at `notice` or a lower level.
 
 ### Behavioral Differences from Python Matter Server
 

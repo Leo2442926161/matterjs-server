@@ -23,34 +23,31 @@ function argv(...args: string[]): string[] {
 
 describe("cli", () => {
     // parseCliArgs reads the ambient environment, and this repo's documented test command exports env vars.
-    let savedEnv: string | undefined;
-    let savedProbePortEnv: string | undefined;
-    let savedListenAddressEnv: string | undefined;
+    const isolatedEnv = [
+        "DISABLE_AUTO_SUBSCRIPTION",
+        "LISTEN_ADDRESS",
+        "CUSTOM_CLUSTER_POLL_INTERVAL",
+        "THREAD_REST_PROBE_PORT",
+        "DCL_OFFLINE",
+        "DISABLE_DCL_SEED",
+        "REVOCATION_SETS_DIR",
+    ];
+    const savedEnv = new Map<string, string | undefined>();
 
     before(() => {
-        savedListenAddressEnv = process.env.LISTEN_ADDRESS;
-        delete process.env.LISTEN_ADDRESS;
-        savedEnv = process.env.CUSTOM_CLUSTER_POLL_INTERVAL;
-        delete process.env.CUSTOM_CLUSTER_POLL_INTERVAL;
-        savedProbePortEnv = process.env.THREAD_REST_PROBE_PORT;
-        delete process.env.THREAD_REST_PROBE_PORT;
+        for (const name of isolatedEnv) {
+            savedEnv.set(name, process.env[name]);
+            delete process.env[name];
+        }
     });
 
     after(() => {
-        if (savedListenAddressEnv === undefined) {
-            delete process.env.LISTEN_ADDRESS;
-        } else {
-            process.env.LISTEN_ADDRESS = savedListenAddressEnv;
-        }
-        if (savedProbePortEnv === undefined) {
-            delete process.env.THREAD_REST_PROBE_PORT;
-        } else {
-            process.env.THREAD_REST_PROBE_PORT = savedProbePortEnv;
-        }
-        if (savedEnv === undefined) {
-            delete process.env.CUSTOM_CLUSTER_POLL_INTERVAL;
-        } else {
-            process.env.CUSTOM_CLUSTER_POLL_INTERVAL = savedEnv;
+        for (const [name, value] of savedEnv) {
+            if (value === undefined) {
+                delete process.env[name];
+            } else {
+                process.env[name] = value;
+            }
         }
     });
 
@@ -139,6 +136,108 @@ describe("cli", () => {
         it("rejects a value that only starts with digits", () => {
             expect(() => parseTcpPortOption("8080abc")).to.throw(InvalidArgumentError);
             expect(() => parseTcpPortOption("1e4")).to.throw(InvalidArgumentError);
+        });
+    });
+
+    describe("--disable-auto-subscription", () => {
+        it("defaults to false", () => {
+            expect(parseCliArgs(argv()).disableAutoSubscription).to.equal(false);
+        });
+
+        it("is set by the flag", () => {
+            expect(parseCliArgs(argv("--disable-auto-subscription")).disableAutoSubscription).to.equal(true);
+            expect(parseCliArgs(argv("--disable-auto-subscription", "false")).disableAutoSubscription).to.equal(false);
+        });
+
+        it("is set by the environment", () => {
+            process.env.DISABLE_AUTO_SUBSCRIPTION = "true";
+            try {
+                expect(parseCliArgs(argv()).disableAutoSubscription).to.equal(true);
+            } finally {
+                delete process.env.DISABLE_AUTO_SUBSCRIPTION;
+            }
+        });
+
+        it("reaches the controller options", () => {
+            const cliOptions = parseCliArgs(argv("--disable-auto-subscription"));
+            expect(controllerOptionsFrom(cliOptions, "server", "1.2.3").disableAutoSubscription).to.equal(true);
+        });
+    });
+
+    describe("--dcl-offline", () => {
+        it("defaults to false", () => {
+            expect(parseCliArgs(argv()).dclOffline).to.equal(false);
+        });
+
+        it("is set by the flag and the environment", () => {
+            expect(parseCliArgs(argv("--dcl-offline")).dclOffline).to.equal(true);
+            process.env.DCL_OFFLINE = "true";
+            try {
+                expect(parseCliArgs(argv()).dclOffline).to.equal(true);
+            } finally {
+                delete process.env.DCL_OFFLINE;
+            }
+        });
+
+        it("reaches the controller options", () => {
+            const cliOptions = parseCliArgs(argv("--dcl-offline"));
+            expect(controllerOptionsFrom(cliOptions, "server", "1.2.3").dclOffline).to.equal(true);
+        });
+
+        it("cannot be combined with --disable-dcl-seed", () => {
+            const cli = JSON.stringify(import.meta.resolve("../src/cli.js"));
+            const result = spawnSync(
+                process.execPath,
+                [
+                    "--input-type=module",
+                    "-e",
+                    `const m = await import(${cli}); m.parseCliArgs(["node", "matter-server", "--dcl-offline", "--disable-dcl-seed"]);`,
+                ],
+                { encoding: "utf8" },
+            );
+
+            expect(result.status, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).to.equal(1);
+            expect(result.stderr).to.include("cannot be combined with --disable-dcl-seed");
+        });
+
+        it("accepts both options set to false", () => {
+            process.env.DCL_OFFLINE = "false";
+            process.env.DISABLE_DCL_SEED = "false";
+            try {
+                const cliOptions = parseCliArgs(argv("--dcl-offline", "false", "--disable-dcl-seed", "false"));
+                expect([cliOptions.dclOffline, cliOptions.disableDclSeed]).deep.equals([false, false]);
+            } finally {
+                delete process.env.DCL_OFFLINE;
+                delete process.env.DISABLE_DCL_SEED;
+            }
+        });
+    });
+
+    describe("--revocation-sets-dir", () => {
+        it("is unset by default", () => {
+            expect(parseCliArgs(argv()).revocationSetsDir).to.equal(null);
+        });
+
+        it("is set by the option and the environment", () => {
+            expect(parseCliArgs(argv("--revocation-sets-dir", "/sets")).revocationSetsDir).to.equal("/sets");
+            process.env.REVOCATION_SETS_DIR = "/env-sets";
+            try {
+                expect(parseCliArgs(argv()).revocationSetsDir).to.equal("/env-sets");
+            } finally {
+                delete process.env.REVOCATION_SETS_DIR;
+            }
+        });
+
+        // Characterization: the options are independent, so nothing rejects the combination.
+        it("combines with --dcl-offline and --enable-test-net-dcl", () => {
+            const options = parseCliArgs(
+                argv("--revocation-sets-dir", "/sets", "--dcl-offline", "--enable-test-net-dcl"),
+            );
+            expect([options.revocationSetsDir, options.dclOffline, options.enableTestNetDcl]).deep.equals([
+                "/sets",
+                true,
+                true,
+            ]);
         });
     });
 
