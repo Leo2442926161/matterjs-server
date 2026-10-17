@@ -55,10 +55,9 @@ This page shows a detailed overview of the changes between versions without the 
 - Enhancement: (@lboue) Added a command panel for the EnergyEvse cluster to the Dashboard
 - Enhancement: Adds the IKEA thermostat ValveCalibration vendor cluster (0x117cfc01) to the custom cluster and a Dashboard panel
 - Enhancement: (@lboue) Allows creating temporary/expiring PIN users (UserType=ExpiringUser) and configuring the lock's ExpiringUserTimeout to the Dashboard DoorLock cluster panel
-- Enhancement: (@RAR) Adds the vendor clusters of the Aqara Spatial Multi-Sensor FP400 (AmbientSensingConfiguration 0x115ffc0a with detection zones, RadarSensingUnion 0x115ffc0b, OccupantLocation 0x115ffc0c with the target position event) to the custom cluster definitions and the Python client
+- Enhancement: (@RAR) Adds the vendor clusters of the Aqara Spatial Multi-Sensor FP400 (AmbientSensingConfiguration 0x115ffc0a with detection zones, RadarSensingUnion 0x115ffc0b, OccupantLocation 0x115ffc0c with the target position event) to the custom cluster definitions
 - Enhancement: (@Leo2442926161) Adds the `indicatorEnable` attribute to the Heiman custom cluster to switch the device LED indicator on or off
-- Enhancement: (@Leo2442926161) Adds the `sirenActivate` command to the Heiman custom cluster to sound or stop the device siren with a siren type, volume and duration, and to the Python client
-- Adjustment: The Heiman `mutingSensor` command requires `mutingTime`; a request without it is refused instead of sent to the device
+- Enhancement: (@Leo2442926161) Adds the `sirenActivate` command to the Heiman custom cluster to sound or stop the device siren with a siren type, volume and duration
 - Enhancement: Adds the WAGO Home Blind Control `WagoBlindType` (roller shutter or venetian blind) and `WagoManualMode` attributes to the Window Covering cluster
 - Enhancement: Node data carries `endpoint_parents`, the direct parent of each endpoint as matter.js resolves it. The Python client and the Dashboard use it instead of deriving the parents from the Descriptor PartsLists, and keep deriving them for servers that do not send it
 - Enhancement: The env var `MATTER_LOG_FORMAT` (`ansi` or `plain`) sets the console log format. The Docker image defaults to `ansi`; otherwise colors are used only when the output is a terminal
@@ -76,7 +75,7 @@ This page shows a detailed overview of the changes between versions without the 
 - Fix: `device_command` with `EndSession` updates the server's session records for that camera only, and a WebRTC callback with an invalid endpoint id no longer blocks the event for other listeners
 - Fix: A command sent before the controller finished starting fails with the SDK stack error code instead of a generic error
 - Fix: The server's debug log masks Wi-Fi passphrases, Thread datasets, setup codes, credential material in `device_command` requests, TURN credentials and SDP ICE credentials, and no longer logs the `open_commissioning_window` response. `device_command` responses are still logged in full. The TypeScript client logs very long strings as their length
-- Fix: The Python client delivers `webrtc_callback` and the camera events to subscribers registered with `node_filter`, as Home Assistant does
+- Fix: The lient delivers `webrtc_callback` and the camera events to subscribers registered with `node_filter`, as Home Assistant does
 - Fix: A wrong pairing code is reported as such instead of as a generic commissioning failure, so a client can ask for the code again. A pairing code that cannot be decoded fails with `InvalidArguments`
 - Fix: Commissioning with a pairing code that names a vendor and product skips a device whose advertisement names another vendor or product
 - Fix: A device that has only its root endpoint is commissioned and reported with its data
@@ -86,7 +85,7 @@ This page shows a detailed overview of the changes between versions without the 
 - Fix: `read_attribute` and `write_attribute` refuse a path with an id that is invalid for its kind (for example cluster 32768) with `InvalidArguments`
 - Fix: Dashboard shows manufacturer-specific enum values (vendor mode tags, operational and error states, closure errors) as "Manufacturer 0x…"
 - Fix: (@RAR) List values of decorator-defined custom clusters are converted in both directions, so bytes inside a list (Aqara `SetZones`) reach the device as bytes instead of strings. The same fix sends `SupportedModes` of the derived Mode clusters (RVC Run/Clean, Dishwasher, Laundry Washer, Oven, Microwave Oven, Refrigerator, Device Energy Management, EVSE and Water Heater Mode) keyed by tag like every other attribute value, instead of keyed by field name
-- Fix: (@RAR) The Python client generator resolves struct, signed integer, list and response types of decorator-defined custom clusters; the `int32` attributes `DraftElectricalMeasurementCluster.activePower` and `ThirdRealityMeteringCluster.instantaneousDemand` are now generated as signed
+- Fix: (@RAR) The lient generator resolves struct, signed integer, list and response types of decorator-defined custom clusters; the `int32` attributes `DraftElectricalMeasurementCluster.activePower` and `ThirdRealityMeteringCluster.instantaneousDemand` are now generated as signed
 - Fix: WebSocket clients that read slowly are no longer disconnected when the server queues messages for them; the queued messages are now delivered
 - Fix: Large negative 64-bit values keep their precision in WebSocket messages, and a text value starting with `__BIGINT__` is no longer turned into a number or rejected; the server and the ws-client share one bigint-aware JSON implementation
 - Fix: Verified endpoint and cluster existence for `device_command` and `write_attribute` and return proper errors
