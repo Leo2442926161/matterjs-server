@@ -58,6 +58,7 @@ This page shows a detailed overview of the changes between versions without the 
 - Enhancement: (@RAR) Adds the vendor clusters of the Aqara Spatial Multi-Sensor FP400 (AmbientSensingConfiguration 0x115ffc0a with detection zones, RadarSensingUnion 0x115ffc0b, OccupantLocation 0x115ffc0c with the target position event) to the custom cluster definitions and the Python client
 - Enhancement: (@Leo2442926161) Adds the `indicatorEnable` attribute to the Heiman custom cluster to switch the device LED indicator on or off
 - Enhancement: (@Leo2442926161) Adds the `sirenActivate` command to the Heiman custom cluster to sound or stop the device siren with a siren type, volume and duration, and to the Python client
+- Adjustment: The Heiman `mutingSensor` command requires `mutingTime`; a request without it is refused instead of sent to the device
 - Enhancement: Adds the WAGO Home Blind Control `WagoBlindType` (roller shutter or venetian blind) and `WagoManualMode` attributes to the Window Covering cluster
 - Enhancement: Node data carries `endpoint_parents`, the direct parent of each endpoint as matter.js resolves it. The Python client and the Dashboard use it instead of deriving the parents from the Descriptor PartsLists, and keep deriving them for servers that do not send it
 - Enhancement: The env var `MATTER_LOG_FORMAT` (`ansi` or `plain`) sets the console log format. The Docker image defaults to `ansi`; otherwise colors are used only when the output is a terminal

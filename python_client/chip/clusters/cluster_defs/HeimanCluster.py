@@ -63,10 +63,10 @@ class HeimanCluster(Cluster):
             def descriptor(cls) -> ClusterObjectDescriptor:
                 return ClusterObjectDescriptor(
                     Fields=[
-                        ClusterObjectFieldDescriptor(Label="mutingTime", Tag=0, Type=typing.Optional[uint]),
+                        ClusterObjectFieldDescriptor(Label="mutingTime", Tag=0, Type=uint),
                     ])
 
-            mutingTime: typing.Optional[uint] = None
+            mutingTime: uint = 0
 
         @dataclass
         class SirenActivate(ClusterCommand):
@@ -79,14 +79,14 @@ class HeimanCluster(Cluster):
             def descriptor(cls) -> ClusterObjectDescriptor:
                 return ClusterObjectDescriptor(
                     Fields=[
-                        ClusterObjectFieldDescriptor(Label="sirenType", Tag=0, Type=typing.Optional[uint]),
-                        ClusterObjectFieldDescriptor(Label="volume", Tag=1, Type=typing.Optional[uint]),
-                        ClusterObjectFieldDescriptor(Label="duration", Tag=2, Type=typing.Optional[uint]),
+                        ClusterObjectFieldDescriptor(Label="sirenType", Tag=0, Type=uint),
+                        ClusterObjectFieldDescriptor(Label="volume", Tag=1, Type=uint),
+                        ClusterObjectFieldDescriptor(Label="duration", Tag=2, Type=uint),
                     ])
 
-            sirenType: typing.Optional[uint] = None
-            volume: typing.Optional[uint] = None
-            duration: typing.Optional[uint] = None
+            sirenType: uint = 0
+            volume: uint = 0
+            duration: uint = 0
 
     class Attributes:
         @dataclass

@@ -4,13 +4,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { attribute, cluster, uint8, writable, command, uint16, field } from "@matter/main/model";
+import { attribute, cluster, uint8, writable, command, uint16, field, mandatory } from "@matter/main/model";
 
 /**
  * Input to the {@link HeimanCluster.mutingSensor} command.
  */
 class MutingSensorCommand {
-    @field(0x0, uint16)
+    @field(0x0, uint16, mandatory)
     mutingTime!: number;
 }
 
@@ -19,15 +19,15 @@ class MutingSensorCommand {
  */
 class SirenActivateCommand {
     /** 0 default, 1 smoke, 2 CO, 3 gas, 4 doorbell, 5 heat alarm. */
-    @field(0x0, uint8)
+    @field(0x0, uint8, mandatory)
     sirenType!: number;
 
     /** 0 to 100. Models without volume control ignore the value. */
-    @field(0x1, uint8)
+    @field(0x1, uint8, mandatory)
     volume!: number;
 
     /** 0 stops the siren, 1 to 0xfffe sounds it for that duration, 0xffff sounds it until stopped. */
-    @field(0x2, uint16)
+    @field(0x2, uint16, mandatory)
     duration!: number;
 }
 
