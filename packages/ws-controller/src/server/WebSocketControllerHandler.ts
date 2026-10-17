@@ -11,17 +11,21 @@ import {
     Bytes,
     camelize,
     ClusterId,
+    Duration,
     FabricIndex,
+    InternalError,
+    isObject,
     Logger,
     LogLevel,
     Millis,
     NodeConnectionState,
     NodeId,
     ObserverGroup,
+    Seconds,
 } from "@matter/main";
 import { WebRtcTransportProvider } from "@matter/main/clusters";
 import { ControllerCommissioningFlowOptions, OperationalDataset } from "@matter/main/protocol";
-import { EndpointNumber } from "@matter/main/types";
+import { EndpointNumber, ReceivedStatusResponseError } from "@matter/main/types";
 import { WebSocketServer } from "ws";
 import type { CameraSignallingCommandName } from "../camera/cameraCommands.js";
 import {
@@ -43,17 +47,19 @@ import {
     PROVIDER_COMMAND_NAMES,
     toProviderCommandFields,
 } from "../camera/webRtcProviderArguments.js";
-import { rejectUnknownKeys } from "../camera/wireArgumentChecks.js";
+import { rejectUnknownKeys, toNodeIdValue } from "../camera/wireArgumentChecks.js";
 import { ControllerCommandHandler } from "../controller/ControllerCommandHandler.js";
 import { MatterController, registerThreadCredentialsFromHex } from "../controller/MatterController.js";
 import type { TopologyNodeSource } from "../controller/NetworkTopologyService.js";
+import { decodeOnboardingPayload, isQrCode } from "../controller/onboardingPayload.js";
 import { TestNodeCommandHandler } from "../controller/TestNodeCommandHandler.js";
 import { dropWebRtcSessionTracking, invokeEndSession } from "../controller/webRtcSessionTracking.js";
 import { VendorIds } from "../data/VendorIDs.js";
 import { ClusterMap, ClusterMapEntry } from "../model/ModelMapper.js";
-import { CommissioningRequest } from "../types/CommandHandler.js";
+import { CommissioningRequest, InteractionSubscription } from "../types/CommandHandler.js";
 import { HttpServer, WebServerHandler } from "../types/WebServer.js";
 import {
+    APIEvents,
     ArgsOf,
     ErrorResultMessage,
     EventTypes,
@@ -73,12 +79,15 @@ import { nodeIdTarget } from "../util/nodeIdClasses.js";
 import { ConfigStorage } from "./ConfigStorage.js";
 import { nextConnectionLogTag, nextConnectionOwnerId } from "./connectionIdentity.js";
 import {
+    convertEventToWebSocket,
     convertMatterToWebSocketNameBased,
     convertMatterToWebSocketTagBased,
     parseBigIntAwareJson,
+    isWellFormedPath,
     splitAttributePath,
     toBigIntAwareJson,
 } from "./Converters.js";
+import { readRequestOf, subscribeRequestOf, subscriptionIdOf } from "./interactionArguments.js";
 import { serializeBatch } from "./serializeBatch.js";
 import { WebSocketConnection } from "./WebSocketConnection.js";
 
@@ -101,7 +110,32 @@ function isIdentityConflict(error: unknown): boolean {
 const EVENT_HISTORY_SIZE = 25;
 
 const SCHEMA_VERSION = 14;
+const MAX_INTERACTION_TIMEOUT_MS = Number.MAX_SAFE_INTEGER;
+/** The Timeout field of a Matter TimedRequest is a uint16. */
+const MAX_TIMED_REQUEST_TIMEOUT_MS = 0xffff;
+
 const MIN_SUPPORTED_SCHEMA_VERSION = 11;
+
+function isUint(value: unknown, max: number): value is number {
+    return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= max;
+}
+
+/** As in python-matter-server, a timed request timeout of 0 means no timed request. */
+function timedRequestTimeoutArgument(stated: number | null | undefined): Duration | undefined {
+    const timeout = timeoutArgument("timed_request_timeout_ms", stated, MAX_TIMED_REQUEST_TIMEOUT_MS);
+    return timeout === 0 ? undefined : timeout;
+}
+
+/** Checks the stated value: a timeout of the wrong type must be refused, not dropped. */
+function timeoutArgument(name: string, stated: number | null | undefined, max: number): Duration | undefined {
+    if (stated === undefined || stated === null) {
+        return undefined;
+    }
+    if (!(Number.isInteger(stated) && stated >= 0 && stated <= max)) {
+        throw ServerError.invalidArguments(`${name} must be an integer from 0 to ${max}`);
+    }
+    return Millis(stated);
+}
 
 // Issuing any of these (schema 12) proves the connection is Thread-aware, so it opts the connection
 // in to `thread_diagnostics_updated` — even if the request itself errors. See the schema changelog.
@@ -187,9 +221,50 @@ function extractWebRtcSessionId(payload: unknown): number | undefined {
     return undefined;
 }
 
-const WRITE_WILDCARD_REFUSAL = "write_attribute does not support wildcards in attribute path";
+const WRITE_WILDCARD_REFUSAL = "write_attribute supports a wildcard only for the endpoint in attribute_path";
 
-/** WebSocket Server compatible with Schema version 12, minimum supported 11 */
+interface OwnedSubscription {
+    connection: WebSocketConnection;
+    subscription: InteractionSubscription;
+}
+
+/** Subscription ids are assigned by each device, so only node and id together name one subscription. */
+function subscriptionKey(nodeId: NodeId, subscriptionId: number) {
+    return `${nodeId}/${subscriptionId}`;
+}
+
+/** The status the device answered with, if the failure is one; matter.js also reports local validation as status errors. */
+function statusResponseOf(error: unknown): ReceivedStatusResponseError | undefined {
+    if (error instanceof ReceivedStatusResponseError) {
+        return error;
+    }
+    if (error instanceof AggregateError) {
+        for (const inner of error.errors) {
+            const status = statusResponseOf(inner);
+            if (status !== undefined) {
+                return status;
+            }
+        }
+    }
+    return error instanceof Error ? statusResponseOf(error.cause) : undefined;
+}
+
+/** 48 hours, the longest a device announces for commissioning (Extended Announcement, Matter Core spec 5.4.2.3.3). */
+const MAX_DISCOVERY_TIMEOUT_S = 48 * 60 * 60;
+
+function discoveryTimeoutOf(seconds: unknown): Duration | undefined {
+    if (seconds === undefined || seconds === null) {
+        return undefined;
+    }
+    if (typeof seconds !== "number" || !(seconds > 0 && seconds <= MAX_DISCOVERY_TIMEOUT_S)) {
+        throw ServerError.invalidArguments(
+            `discovery_timeout_s must be a number of seconds above 0 and at most ${MAX_DISCOVERY_TIMEOUT_S}, got ${String(seconds)}`,
+        );
+    }
+    return Seconds(seconds);
+}
+
+/** WebSocket Server with the Python Matter Server compatible API, see {@link SCHEMA_VERSION}. */
 export class WebSocketControllerHandler implements WebServerHandler {
     #controller: MatterController;
     #commandHandler: ControllerCommandHandler;
@@ -218,6 +293,8 @@ export class WebSocketControllerHandler implements WebServerHandler {
      * or release another connection's claim.
      */
     #fabricLabelOwner?: WebSocketConnection;
+    /** Subscriptions opened with `subscribe`, keyed by {@link subscriptionKey}, each owned by the connection that opened it. */
+    #interactionSubscriptions = new Map<string, OwnedSubscription>();
 
     constructor(controller: MatterController, config: ConfigStorage, serverVersion: string) {
         this.#controller = controller;
@@ -491,44 +568,12 @@ export class WebSocketControllerHandler implements WebServerHandler {
             observers.on(this.#commandHandler.events.eventChanged, (nodeId, data) => {
                 if (this.#closed || this.#shuttingDown || !listening) return;
                 const { path, events } = data;
-                const { endpointId, clusterId, eventId } = path;
-                const clusterData = ClusterMap[clusterId];
 
                 for (const event of events) {
                     // Shared Observable: an uncaught throw aborts the emit and starves other connections;
                     // per event so one bad payload doesn't drop the rest of the batch.
                     try {
-                        let timestamp: number | bigint;
-                        let timestampType: number;
-
-                        if (event.epochTimestamp !== undefined) {
-                            timestamp = event.epochTimestamp;
-                            timestampType = 1; // Epoch
-                        } else if (event.systemTimestamp !== undefined) {
-                            timestamp = event.systemTimestamp;
-                            timestampType = 0; // System
-                        } else {
-                            timestamp = Date.now();
-                            timestampType = 2; // POSIX (fallback)
-                        }
-
-                        const eventModel = clusterData?.events[eventId];
-                        const convertedData =
-                            event.data !== undefined
-                                ? convertMatterToWebSocketNameBased(event.data, eventModel, clusterData?.model)
-                                : null;
-
-                        const nodeEvent: MatterNodeEvent = {
-                            node_id: nodeId,
-                            endpoint_id: endpointId,
-                            cluster_id: clusterId,
-                            event_id: eventId,
-                            event_number: event.eventNumber,
-                            priority: event.priority,
-                            timestamp,
-                            timestamp_type: timestampType,
-                            data: convertedData,
-                        };
+                        const nodeEvent = convertEventToWebSocket(nodeId, path, event);
 
                         this.#addEventToHistory(nodeEvent);
 
@@ -725,6 +770,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
                 logger.info(`[${connId}] WebSocket connection closed`);
                 observers.close();
                 this.#connections.delete(connection);
+                this.#closeInteractionSubscriptionsOf(connection);
                 this.#controller.cameraStreamsIfCreated
                     ?.releaseConnection(ownerId)
                     .catch(err => logger.warn(`[${connId}] Failed to release camera sessions on disconnect`, err));
@@ -753,7 +799,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
                     optInToEventsFor,
                     req?.socket?.remoteAddress,
                 )
-                    .then(({ response, enableListeners }) => {
+                    .then(({ response, enableListeners, afterResponse }) => {
                         if (this.#closed) return;
                         if (enableListeners) {
                             // Unlike the event opt-ins, listening starts only once start_listening has
@@ -761,6 +807,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
                             listening = true;
                         }
                         connection.sendReliable(toBigIntAwareJson(response));
+                        afterResponse?.();
                     })
                     .catch(err => logger.error(`[${connId}] WebSocket request error`, err));
             });
@@ -810,6 +857,8 @@ export class WebSocketControllerHandler implements WebServerHandler {
         // but that races the socket close events.
         for (const connection of this.#connections) connection.dispose();
         this.#connections.clear();
+        for (const { subscription } of this.#interactionSubscriptions.values()) subscription.close();
+        this.#interactionSubscriptions.clear();
 
         const wss = this.#wss;
         // Wait for the WebSocket server to close properly
@@ -834,6 +883,8 @@ export class WebSocketControllerHandler implements WebServerHandler {
     ): Promise<{
         response: ErrorResultMessage | SuccessResultMessage;
         enableListeners?: boolean;
+        /** Runs once the response is sent. */
+        afterResponse?: () => void;
     }> {
         let messageId: string | undefined;
         let command: string | undefined;
@@ -852,6 +903,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
             }
             let result: ResponseOf<any>;
             let enableListeners: boolean | undefined = undefined;
+            let afterResponse: (() => void) | undefined;
             switch (command) {
                 case "start_listening":
                     result = this.#handleStartListening(args);
@@ -868,6 +920,9 @@ export class WebSocketControllerHandler implements WebServerHandler {
                     break;
                 case "commission_on_network":
                     result = await this.#handleCommissionOnNetwork(args);
+                    break;
+                case "parse_onboarding_payload":
+                    result = this.#handleParseOnboardingPayload(args);
                     break;
                 case "get_icd_state":
                     result = await this.#handleGetIcdState(args);
@@ -893,11 +948,31 @@ export class WebSocketControllerHandler implements WebServerHandler {
                 case "read_attribute":
                     result = await this.#handleReadAttribute(args);
                     break;
+                case "read":
+                    result = await this.#commandHandler.read(
+                        readRequestOf(this.#interactionNodeId(args, "read"), args),
+                    );
+                    break;
+                case "subscribe":
+                    ({ result, afterResponse } = await this.#handleSubscribe(args, connection));
+                    break;
+                case "unsubscribe":
+                    result = this.#handleUnsubscribe(args, connection);
+                    break;
+                case "enable_auto_subscription":
+                    result = await this.#handleSetAutoSubscription(args, true);
+                    break;
+                case "disable_auto_subscription":
+                    result = await this.#handleSetAutoSubscription(args, false);
+                    break;
                 case "get_vendor_names":
                     result = await this.#handleGetVendorNames(args);
                     break;
                 case "device_command":
-                    result = await this.#handleDeviceCommand(args, ownerId);
+                    result = await this.#handleDeviceCommand(args, ownerId, connection);
+                    break;
+                case "batched_device_commands":
+                    result = await this.#handleBatchedDeviceCommands(args);
                     break;
                 case "send_webrtc_provider_command":
                     result = await this.#handleSendWebRtcProviderCommand(args);
@@ -956,6 +1031,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
                     result = await this.#handleGetAllCredentials();
                     break;
                 case "get_thread_border_routers":
+                    this.#controller.startBorderRouterDiscovery();
                     result = this.#controller.borderRouters.list();
                     break;
                 case "get_thread_diagnostics":
@@ -1023,15 +1099,20 @@ export class WebSocketControllerHandler implements WebServerHandler {
                     result,
                 },
                 enableListeners,
+                afterResponse,
             };
         } catch (err) {
             logger.error(`[${connId}] WebSocket error response (${command})`, messageId, err);
             const errorCode = err instanceof ServerError ? err.code : ServerErrorCode.UnknownError;
+            const status = statusResponseOf(err);
             return {
                 response: {
                     message_id: messageId ?? "",
                     error_code: errorCode,
                     details: (err as Error).message,
+                    ...(status !== undefined && { status: status.code }),
+                    ...(status?.clusterCode !== undefined && { cluster_status: status.clusterCode }),
+                    ...(err instanceof ServerError && err.reason !== undefined && { reason: err.reason }),
                 },
             };
         }
@@ -1178,13 +1259,14 @@ export class WebSocketControllerHandler implements WebServerHandler {
         const reason = lastError instanceof Error ? `: ${lastError.message}` : "";
         throw ServerError.nodeCommissionFailed(
             `Commission failed: could not find a free node id after ${MAX_COMMISSION_NODE_ID_ATTEMPTS} attempts${reason}`,
+            "other",
             lastError instanceof Error ? lastError : undefined,
         );
     }
 
     async #handleCommissionWithCode(args: ArgsOf<"commission_with_code">): Promise<ResponseOf<"commission_with_code">> {
         const { code, network_only, wifi_credentials_id, thread_dataset_id } = args;
-        const isQrCode = code.startsWith("MT:");
+        const discoveryTimeout = discoveryTimeoutOf(args.discovery_timeout_s);
 
         const wifiId = wifi_credentials_id ?? ConfigStorage.DEFAULT_CREDENTIAL_ID;
         const threadId = thread_dataset_id ?? ConfigStorage.DEFAULT_CREDENTIAL_ID;
@@ -1222,12 +1304,46 @@ export class WebSocketControllerHandler implements WebServerHandler {
         const nodeId = await this.#commissionWithRetry(nodeId => ({
             nodeId,
             onNetworkOnly: network_only,
-            ...(isQrCode ? { qrCode: code } : { manualCode: code }),
+            discoveryTimeout,
+            ...(isQrCode(code) ? { qrCode: code } : { manualCode: code }),
             wifiCredentials,
             threadCredentials,
         }));
 
         return this.#collectNodeDetails(nodeId);
+    }
+
+    #handleParseOnboardingPayload(args: ArgsOf<"parse_onboarding_payload">): ResponseOf<"parse_onboarding_payload"> {
+        const { code } = args;
+        if (typeof code !== "string") {
+            throw ServerError.invalidArguments("parse_onboarding_payload requires code as a string");
+        }
+        const decoded = decodeOnboardingPayload(code);
+        if (decoded.type === "manual") {
+            const { shortDiscriminator, passcode, vendorId, productId } = decoded.payload;
+            if (shortDiscriminator === undefined) {
+                throw new InternalError("A decoded manual pairing code has no short discriminator");
+            }
+            return {
+                type: "manual",
+                short_discriminator: shortDiscriminator,
+                setup_pin_code: passcode,
+                vendor_id: vendorId,
+                product_id: productId,
+            };
+        }
+        return {
+            type: "qr",
+            payloads: decoded.payloads.map(payload => ({
+                version: payload.version,
+                vendor_id: payload.vendorId,
+                product_id: payload.productId,
+                flow_type: payload.flowType,
+                discovery_capabilities: payload.discoveryCapabilities,
+                discriminator: payload.discriminator,
+                setup_pin_code: payload.passcode,
+            })),
+        };
     }
 
     async #handleCommissionOnNetwork(
@@ -1241,6 +1357,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
 
         const baseRequest = {
             onNetworkOnly: true, // commission_on_network is always network-only
+            discoveryTimeout: discoveryTimeoutOf(args.discovery_timeout_s),
             // Ignore fe80 addresses and better do generic discovery because could be from mobile devices
             knownAddress: ip_addr && !ip_addr.startsWith("fe80") ? { ip: ip_addr, port: 5540 } : undefined,
         };
@@ -1256,12 +1373,16 @@ export class WebSocketControllerHandler implements WebServerHandler {
                     throw ServerError.invalidArguments("filter required for filter_type 2 (long discriminator)");
                 commissionRequest = { ...baseRequest, passcode: setup_pin_code, longDiscriminator: filter };
                 break;
-            case 3: // Vendor ID - not optimal but working
+            case 3: // Vendor ID
                 if (filter === undefined)
                     throw ServerError.invalidArguments("filter required for filter_type 3 (vendor ID)");
-                commissionRequest = { ...baseRequest, passcode: setup_pin_code, vendorId: filter, productId: 0 };
+                commissionRequest = { ...baseRequest, passcode: setup_pin_code, vendorId: filter };
                 break;
-            case 4: // Device type - not directly supported, fall back to no filter
+            case 4: // Device type
+                if (filter === undefined)
+                    throw ServerError.invalidArguments("filter required for filter_type 4 (device type)");
+                commissionRequest = { ...baseRequest, passcode: setup_pin_code, deviceType: filter };
+                break;
             case 0: // No filter
             default:
                 // Discover any commissionable device with the passcode
@@ -1342,41 +1463,189 @@ export class WebSocketControllerHandler implements WebServerHandler {
         return result;
     }
 
+    #interactionNodeId(args: Record<string, unknown>, command: "read" | "subscribe" | "unsubscribe"): NodeId {
+        const nodeId = this.#targetNodeId(toNodeIdValue(args.node_id, command), command);
+        if (command !== "unsubscribe" && TestNodeCommandHandler.isTestNodeId(nodeId)) {
+            throw ServerError.invalidArguments("read and subscribe are not supported for test nodes");
+        }
+        return nodeId;
+    }
+
+    /** The subscription's events are held until the response is sent, so the client knows the id first. */
+    async #handleSubscribe(
+        args: Record<string, unknown>,
+        connection: WebSocketConnection,
+    ): Promise<{ result: ResponseOf<"subscribe">; afterResponse: () => void }> {
+        const nodeId = this.#interactionNodeId(args, "subscribe");
+        const request = subscribeRequestOf(nodeId, args);
+        const pending = new Array<(id: number) => void>();
+        let deliver = (send: (id: number) => void) => {
+            pending.push(send);
+        };
+        const registered: { key?: string; entry?: OwnedSubscription } = {};
+
+        const subscription = await this.#commandHandler.subscribe(request, {
+            report: report =>
+                deliver(id =>
+                    this.#sendSubscriptionEvent(
+                        connection,
+                        "subscription_report",
+                        { node_id: nodeId, subscription_id: id, ...report },
+                        "ordered",
+                    ),
+                ),
+            // An unsubscribe or the owner's connection close removes the entry first, so only an end the owner
+            // did not ask for is announced.
+            closed: () => {
+                const { key, entry } = registered;
+                if (key === undefined || this.#interactionSubscriptions.get(key) !== entry) {
+                    return;
+                }
+                this.#interactionSubscriptions.delete(key);
+                // Never dropped under backpressure: a lost end notice leaves the client trusting a dead subscription.
+                deliver(id =>
+                    this.#sendSubscriptionEvent(
+                        connection,
+                        "subscription_ended",
+                        { node_id: nodeId, subscription_id: id },
+                        "reliable",
+                    ),
+                );
+            },
+        });
+
+        const { id } = subscription;
+        if (!this.#connections.has(connection)) {
+            subscription.close();
+            throw ServerError.unknownError("The connection closed while subscribing");
+        }
+        const key = subscriptionKey(nodeId, id);
+        if (this.#interactionSubscriptions.has(key)) {
+            subscription.close();
+            throw ServerError.sdkStackError(
+                `Subscription id ${id} of node ${formatNodeId(nodeId)} is already in use by another subscription`,
+            );
+        }
+        registered.key = key;
+        registered.entry = { connection, subscription };
+        this.#interactionSubscriptions.set(key, registered.entry);
+
+        return {
+            result: { subscription_id: id, ...subscription.priming },
+            afterResponse: () => {
+                for (const send of pending.splice(0)) {
+                    send(id);
+                }
+                deliver = send => send(id);
+            },
+        };
+    }
+
+    #sendSubscriptionEvent<E extends "subscription_report" | "subscription_ended">(
+        connection: WebSocketConnection,
+        event: E,
+        data: APIEvents[E]["data"],
+        delivery: "ordered" | "reliable",
+    ) {
+        try {
+            const frame = toBigIntAwareJson({ event, data });
+            if (delivery === "reliable") {
+                connection.sendReliable(frame);
+            } else {
+                connection.sendOrdered(frame);
+            }
+        } catch (err) {
+            logger.error(
+                `[${connection.connId}] Failed to send ${event} for subscription ${data.subscription_id} of node ${formatNodeId(NodeId(data.node_id))}`,
+                err,
+            );
+        }
+    }
+
+    #handleUnsubscribe(args: Record<string, unknown>, connection: WebSocketConnection): ResponseOf<"unsubscribe"> {
+        if (!this.#commandHandler.autoSubscriptionDisabled) {
+            throw ServerError.invalidArguments(
+                "unsubscribe requires the server to run with --disable-auto-subscription",
+            );
+        }
+        const nodeId = this.#interactionNodeId(args, "unsubscribe");
+        const subscriptionId = subscriptionIdOf(args.subscription_id);
+        const key = subscriptionKey(nodeId, subscriptionId);
+        const entry = this.#interactionSubscriptions.get(key);
+        if (entry === undefined || entry.connection !== connection) {
+            throw ServerError.invalidArguments(
+                `No subscription ${subscriptionId} of node ${formatNodeId(nodeId)} on this connection`,
+            );
+        }
+        this.#interactionSubscriptions.delete(key);
+        entry.subscription.close();
+        return null;
+    }
+
+    async #handleSetAutoSubscription(
+        args: ArgsOf<"enable_auto_subscription" | "disable_auto_subscription">,
+        enabled: boolean,
+    ): Promise<null> {
+        const nodeId = this.#targetNodeId(
+            args.node_id,
+            enabled ? "enable_auto_subscription" : "disable_auto_subscription",
+        );
+        if (TestNodeCommandHandler.isTestNodeId(nodeId)) {
+            throw ServerError.invalidArguments("Auto subscription commands are not supported for test nodes");
+        }
+        await this.#commandHandler.setAutoSubscription(nodeId, enabled);
+        return null;
+    }
+
+    #closeInteractionSubscriptionsOf(connection: WebSocketConnection) {
+        for (const [key, entry] of this.#interactionSubscriptions) {
+            if (entry.connection === connection) {
+                this.#interactionSubscriptions.delete(key);
+                entry.subscription.close();
+            }
+        }
+    }
+
     async #handleWriteAttribute(args: ArgsOf<"write_attribute">): Promise<ResponseOf<"write_attribute">> {
-        const { node_id, attribute_path, value } = args;
+        const { node_id, attribute_path, value, timed_request_timeout_ms } = args;
         const { nodeId, group } = this.#targetNodeIdOrGroup(node_id, "write_attribute");
+        // A malformed endpoint would otherwise read as the wildcard and write every endpoint of the node.
+        if (!group && !isWellFormedPath(attribute_path, 3)) {
+            throw ServerError.invalidArguments(
+                'write_attribute needs attribute_path as endpoint/cluster/attribute, each a number or "*"',
+            );
+        }
         const { endpointId, clusterId, attributeId } = splitAttributePath(attribute_path);
+        if (clusterId === undefined || attributeId === undefined) {
+            throw ServerError.invalidArguments(WRITE_WILDCARD_REFUSAL);
+        }
 
         if (group) {
-            if (clusterId === undefined || attributeId === undefined) {
-                throw ServerError.invalidArguments(WRITE_WILDCARD_REFUSAL);
-            }
             if (endpointId !== undefined) {
                 throw ServerError.invalidArguments(
                     "write_attribute to a Group Node ID takes a wildcard endpoint in attribute_path: a groupcast carries no endpoint, each node's own group table decides which of its endpoints the write reaches",
                 );
             }
+            if (timed_request_timeout_ms !== undefined && timed_request_timeout_ms !== null) {
+                throw ServerError.invalidArguments("timed_request_timeout_ms cannot accompany a groupcast write");
+            }
             await this.#commandHandler.handleGroupWriteAttribute({ nodeId, clusterId, attributeId, value });
             return null;
         }
 
-        if (endpointId === undefined || clusterId === undefined || attributeId === undefined) {
-            throw ServerError.invalidArguments(WRITE_WILDCARD_REFUSAL);
-        }
-
-        const { status } = await this.#handlerFor(nodeId).handleWriteAttribute({
+        const results = await this.#handlerFor(nodeId).handleWriteAttribute({
             nodeId,
             endpointId,
             clusterId,
             attributeId,
             value,
+            timedInteractionTimeoutMs: timedRequestTimeoutArgument(timed_request_timeout_ms),
         });
-        return [
-            {
-                Path: { EndpointId: endpointId, ClusterId: clusterId, AttributeId: attributeId },
-                Status: status ?? 0,
-            },
-        ];
+        return results.map(({ endpointId, clusterId, attributeId, status, clusterStatus }) => ({
+            Path: { EndpointId: endpointId, ClusterId: clusterId, AttributeId: attributeId },
+            Status: status ?? 0,
+            ...(clusterStatus !== undefined && { ClusterStatus: clusterStatus }),
+        }));
     }
 
     async #handleGetVendorNames(args: ArgsOf<"get_vendor_names">): Promise<ResponseOf<"get_vendor_names">> {
@@ -1417,6 +1686,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
     async #handleDeviceCommand(
         args: ArgsOf<"device_command">,
         requestedBy: string,
+        connection: WebSocketConnection,
     ): Promise<ResponseOf<"device_command">> {
         const {
             node_id,
@@ -1457,6 +1727,12 @@ export class WebSocketControllerHandler implements WebServerHandler {
         if (endpointId === undefined || endpointId === null) {
             throw ServerError.invalidArguments("device_command requires endpoint_id unless node_id is a Group Node ID");
         }
+        const timedTimeout = timedRequestTimeoutArgument(timedInteractionTimeoutMs);
+        const interactionTimeout = timeoutArgument(
+            "interaction_timeout_ms",
+            interactionTimeoutMs,
+            MAX_INTERACTION_TIMEOUT_MS,
+        );
 
         const camelizedCommand = camelize(commandName);
         const invoke = (): Promise<unknown> =>
@@ -1466,8 +1742,9 @@ export class WebSocketControllerHandler implements WebServerHandler {
                 clusterId: ClusterId(clusterId),
                 commandName: camelizedCommand,
                 data: payload,
-                timedInteractionTimeoutMs:
-                    typeof timedInteractionTimeoutMs === "number" ? Millis(timedInteractionTimeoutMs) : undefined,
+                timedInteractionTimeoutMs: timedTimeout,
+                interactionTimeoutMs: interactionTimeout,
+                dedupScope: connection,
             });
 
         const endsWebRtcSession =
@@ -1503,6 +1780,66 @@ export class WebSocketControllerHandler implements WebServerHandler {
             return null;
         }
         return cmdResult;
+    }
+
+    async #handleBatchedDeviceCommands(
+        args: ArgsOf<"batched_device_commands">,
+    ): Promise<ResponseOf<"batched_device_commands">> {
+        const { node_id, commands, timed_request_timeout_ms, interaction_timeout_ms } = args;
+        const nodeId = this.#targetNodeId(node_id, "batched_device_commands");
+        if (!Array.isArray(commands) || commands.length === 0) {
+            throw ServerError.invalidArguments("batched_device_commands requires a non-empty commands list");
+        }
+        const requested = commands.map((command: unknown, index) => {
+            if (!isObject(command)) {
+                throw ServerError.invalidArguments(`batched_device_commands command ${index} must be an object`);
+            }
+            const { endpoint_id, cluster_id, command_name, payload } = command;
+            if (!isUint(endpoint_id, 0xfffe) || !isUint(cluster_id, 0xffffffff) || typeof command_name !== "string") {
+                throw ServerError.invalidArguments(
+                    `batched_device_commands command ${index} needs endpoint_id, cluster_id and command_name`,
+                );
+            }
+            // The server tracks WebRTC sessions per command, which a batch cannot do.
+            if (cluster_id === WebRtcTransportProvider.id) {
+                throw ServerError.invalidArguments(
+                    `batched_device_commands command ${index}: send WebRTC Transport Provider commands with device_command or send_webrtc_provider_command`,
+                );
+            }
+            return {
+                endpointId: EndpointNumber(endpoint_id),
+                // An id outside the cluster ranges is refused as an unknown cluster, not by the constructor.
+                clusterId: ClusterId(cluster_id, false),
+                commandName: command_name,
+                data: payload ?? {},
+            };
+        });
+
+        const results = await this.#handlerFor(nodeId).handleBatchedInvoke({
+            nodeId,
+            commands: requested,
+            timedInteractionTimeoutMs: timedRequestTimeoutArgument(timed_request_timeout_ms),
+            interactionTimeoutMs: timeoutArgument(
+                "interaction_timeout_ms",
+                interaction_timeout_ms,
+                MAX_INTERACTION_TIMEOUT_MS,
+            ),
+        });
+        return results.map(({ status, clusterStatus, data }, index) => {
+            const response =
+                data === undefined
+                    ? undefined
+                    : this.#convertCommandDataToWebSocket(
+                          requested[index].clusterId,
+                          requested[index].commandName,
+                          data,
+                      );
+            return {
+                status,
+                ...(clusterStatus !== undefined && { cluster_status: clusterStatus }),
+                ...(response !== undefined && { response }),
+            };
+        });
     }
 
     /**
@@ -1753,12 +2090,17 @@ export class WebSocketControllerHandler implements WebServerHandler {
         args: ArgsOf<"get_thread_diagnostics">,
     ): Promise<ResponseOf<"get_thread_diagnostics">> {
         if (args.ext_pan_id === undefined) {
+            this.#controller.startBorderRouterDiscovery();
             this.#controller.threadDiagnostics.refreshAllKnown({ force: args.force });
             const diagnostics = this.#controller.threadDiagnostics;
             return diagnostics.listCached().map(batch => serializeBatch(batch, diagnostics.remainingTtl(batch)));
         }
         if (!/^[0-9a-fA-F]{16}$/.test(args.ext_pan_id)) {
             throw ServerError.invalidArguments(`Invalid ext_pan_id "${args.ext_pan_id}": expected 16 hex characters`);
+        }
+        // An empty registry would make the service publish the Border Router as unreachable to every listener.
+        if (this.#controller.startBorderRouterDiscovery()) {
+            return null;
         }
         const batch = await this.#controller.threadDiagnostics.getOrFetch(args.ext_pan_id.toLowerCase(), {
             force: args.force,
@@ -1771,6 +2113,7 @@ export class WebSocketControllerHandler implements WebServerHandler {
     }
 
     async #handleGetNetworkTopology(args: ArgsOf<"get_network_topology">): Promise<ResponseOf<"get_network_topology">> {
+        this.#controller.startBorderRouterDiscovery();
         // Imported test nodes are served by get_nodes, so the derived graph must include them
         // too. Attached here (not at construction) to keep the service lazily instantiated.
         this.#controller.networkTopology.addNodeSource(this.#testNodeSource);

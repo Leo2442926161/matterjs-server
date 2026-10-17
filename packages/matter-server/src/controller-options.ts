@@ -22,6 +22,7 @@ export function controllerOptionsFrom(
         enableTestNetDcl: cliOptions.enableTestNetDcl,
         disableOtaProvider: cliOptions.disableOta,
         disableDclSeed: cliOptions.disableDclSeed,
+        dclOffline: cliOptions.dclOffline,
         serverId,
         serverVersion,
         bleProxyEnabled: cliOptions.bleProxy,
@@ -29,6 +30,7 @@ export function controllerOptionsFrom(
         disableThreadDiagnostics: cliOptions.disableThreadDiagnostics,
         threadRestProbePort: cliOptions.threadRestProbePort ?? undefined,
         customClusterPollInterval: Seconds(cliOptions.customClusterPollInterval),
+        disableAutoSubscription: cliOptions.disableAutoSubscription,
         otaUpload: {
             // Staged next to the images it feeds, so importing one never crosses a filesystem.
             tempDir: join(cliOptions.otaProviderDir ?? cliOptions.storagePath, "ota-uploads"),

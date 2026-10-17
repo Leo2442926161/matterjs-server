@@ -6,6 +6,7 @@
 
 import {
     ControllerBehavior,
+    DclBehavior,
     Endpoint,
     Environment,
     FabricId,
@@ -17,12 +18,14 @@ import {
 } from "@matter/main";
 import { Ble, Fabric, FabricAuthority, FabricManager } from "@matter/main/protocol";
 import { OtaProviderEndpoint } from "@matter/node/endpoints/ota-provider";
+import { applyCertContext, loadCertContext } from "./certContext.js";
 import { CameraControllerEndpoint } from "./ControllerCommandHandler.js";
-import { PeerSettingsRepairMarker, repairRestoredPeers } from "./restoredPeers.js";
+import { applyAutoSubscribe, PeerSettingsRepairMarker, repairRestoredPeers } from "./restoredPeers.js";
+import { ServerSoftwareUpdateManager } from "./ServerSoftwareUpdateManager.js";
 
 // A controller joins fabrics, it does not serve groupcast, and the Groupcast listener would pull in the
 // Auxiliary ACL feature with it.
-const ControllerRootEndpoint = ServerNode.RootEndpointWithoutGroupcast.with(ControllerBehavior);
+const ControllerRootEndpoint = ServerNode.RootEndpointWithoutGroupcast.with(ControllerBehavior, DclBehavior);
 type ControllerRootEndpoint = typeof ControllerRootEndpoint;
 
 /**
@@ -53,6 +56,15 @@ export interface ControllerNodeOptions {
      * Omit to skip the repair.
      */
     peerSettingsRepair?: PeerSettingsRepairMarker;
+
+    /** Applied to every stored peer on each build, in both directions. Defaults to false. */
+    disableAutoSubscription?: boolean;
+
+    /**
+     * DCL settings, in place before any endpoint is added: the OTA provider creates its DCL service while it is added,
+     * and matter.js reads `offline` only when a service is created.
+     */
+    dcl?: { acceptTestCertificates: boolean; offline: boolean };
 }
 
 export interface ControllerResources {
@@ -80,6 +92,7 @@ export interface ControllerNode extends ControllerResources {
 export async function createControllerNode(options: ControllerNodeOptions): Promise<ControllerNode> {
     const { environment, id, adminVendorId, adminFabricId, adminFabricLabel, serverVersion } = options;
     const adminNodeId = NodeId(112233); // TODO Remove when we switch to random IDs
+    const certContext = await loadCertContext(environment, options.disableAutoSubscription ?? false);
 
     const node = await ServerNode.create(ControllerRootEndpoint, {
         environment,
@@ -108,11 +121,17 @@ export async function createControllerNode(options: ControllerNodeOptions): Prom
         // A controller is never itself commissionable, and subscription persistence is a device feature.
         commissioning: { enabled: false },
         subscriptions: { persistenceEnabled: false },
+        dcl: { fetchTestCertificates: true, ...options.dcl },
     });
 
     try {
         const otaProvider = options.enableOtaProvider
-            ? await node.add(new Endpoint(OtaProviderEndpoint, { id: "ota-provider" }))
+            ? await node.add(
+                  new Endpoint(OtaProviderEndpoint.with(ServerSoftwareUpdateManager), {
+                      id: "ota-provider",
+                      softwareupdates: { checkOnRequestOnly: options.disableAutoSubscription ?? false },
+                  }),
+              )
             : undefined;
         const webRtcRequestor = await node.add(new Endpoint(CameraControllerEndpoint, { id: "camera-controller" }));
 
@@ -128,9 +147,14 @@ export async function createControllerNode(options: ControllerNodeOptions): Prom
             adminFabricId,
         });
 
+        if (certContext !== undefined) {
+            await applyCertContext(node, fabricIndex, certContext);
+        }
+
         if (options.peerSettingsRepair !== undefined) {
             await repairRestoredPeers(node, id, options.peerSettingsRepair);
         }
+        await applyAutoSubscribe(node, !options.disableAutoSubscription);
 
         return {
             node,

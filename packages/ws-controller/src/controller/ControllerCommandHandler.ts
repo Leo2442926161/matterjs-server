@@ -10,6 +10,9 @@ import {
     AsyncObservable,
     camelize,
     causedBy,
+    DiscoveryError,
+    DiscoveryIncompleteError,
+    NoDiscoveryTransportError,
     ClientNode,
     CommissioningClient,
     ControllerBehavior,
@@ -18,6 +21,7 @@ import {
     FabricIndex,
     IcdClient,
     IcdMultiAdminError,
+    InternalError,
     isObject,
     Logger,
     MatterAggregateError,
@@ -30,6 +34,7 @@ import {
     SoftwareUpdateInfo,
     SoftwareUpdateManager,
     Time,
+    TimeoutError,
     Timer,
     DnsRecordType,
     EndpointLifecycle,
@@ -48,6 +53,8 @@ import {
 import { WebRtcTransportProvider } from "@matter/main/clusters/web-rtc-transport-provider";
 import {
     AttestationFinding,
+    CommissioningTimeoutError,
+    DEFAULT_CASE_CONNECTION_TIMEOUT,
     DeviceAttestationCheck,
     Fabric,
     FabricManager,
@@ -55,7 +62,10 @@ import {
     PasscodeMismatchError,
     PeerAddress,
     PeerSet,
+    PlainClientSubscribe,
     Read,
+    ReadResult,
+    ResultStatus,
     Specifier,
     Write,
 } from "@matter/main/protocol";
@@ -63,14 +73,17 @@ import {
     AttributeId,
     ClusterId,
     ClusterType,
+    DataVersionFilter,
     DeviceTypeId,
     EndpointNumber,
+    EventNumber,
+    EventPath,
     GroupId,
-    ManualPairingCodeCodec,
-    QrPairingCodeCodec,
     SpecificationVersion,
+    ReceivedStatusResponseError,
     Status,
     StatusResponseError,
+    ValidationError,
     VendorId,
 } from "@matter/main/types";
 import { CommissioningDiscovery, Endpoint, ServerNode } from "@matter/node";
@@ -83,12 +96,17 @@ import { ClusterMap, ClusterMapEntry, GlobalAttributes } from "../model/ModelMap
 import {
     buildAttributePath,
     convertCommandDataToMatter,
+    convertEventToWebSocket,
     convertMatterToWebSocketTagBased,
     convertWebSocketTagBasedToMatter,
     getDateAsString,
+    pathStatusOf,
     splitAttributePath,
+    splitEventPath,
+    statusPathOf,
     toBigIntAwareJson,
 } from "../server/Converters.js";
+import { checkInteractionRequest } from "../server/interactionArguments.js";
 import {
     AttributeResponseStatus,
     AttributesData,
@@ -96,11 +114,18 @@ import {
     CommissioningResponse,
     DiscoveryRequest,
     DiscoveryResponse,
+    InteractionReadRequest,
+    InteractionReport,
+    InteractionSubscribeRequest,
+    InteractionSubscription,
+    InteractionSubscriptionListener,
     InvokeRequest,
     MatterNodeData,
     OpenCommissioningWindowRequest,
     OpenCommissioningWindowResponse,
     WriteAttributeRequest,
+    BatchedInvokeRequest,
+    BatchedInvokeResult,
 } from "../types/CommandHandler.js";
 import {
     AccessControlEntry,
@@ -108,9 +133,12 @@ import {
     AttributeWriteResult,
     BindingTarget,
     IcdStateData,
+    MatterNodeEvent,
     MatterSoftwareVersion,
+    CommissionFailureReason,
     NodePingResult,
     ServerError,
+    ServerErrorCode,
     UpdateSource,
 } from "../types/WebSocketMessageTypes.js";
 import { isBridgeNode } from "../util/bridgeDetection.js";
@@ -122,6 +150,7 @@ import type { ControllerResources } from "./ControllerNode.js";
 import { CustomClusterPoller } from "./CustomClusterPoller.js";
 import { NodeAttributeReader } from "./NodeProcessor.js";
 import { Nodes } from "./Nodes.js";
+import { decodeManualCode, decodeQrCode } from "./onboardingPayload.js";
 import { AttributeChange, EventChange, PeerChangeBus } from "./PeerChangeBus.js";
 import { ThreadDetailsPoller } from "./ThreadDetailsPoller.js";
 import { pushNodeTime, TimeSyncInvokers } from "./timeSyncCommands.js";
@@ -228,12 +257,29 @@ export interface ControllerCommandHandlerOptions {
     threadDiagnosticsEnabled?: boolean;
     /** Interval between custom cluster polling cycles. Defaults to, and is floored at, 60 seconds. */
     customClusterPollInterval?: Duration;
+    /**
+     * Do not subscribe to peers on our own, neither after commissioning nor when the server starts, unless switched on
+     * per peer. Defaults to false.
+     */
+    disableAutoSubscription?: boolean;
 }
 
 /**
  * Cast: matter.js types the `ClusterType(model)` overload as `object`, but a `ClusterMap` model always
  * carries the id `ClusterLike` requires.
  */
+/** A field value matter.js refuses while encoding is a bad argument of the caller, not a server failure. */
+function invokeRequestOf(definition: Invoke.Definition) {
+    try {
+        return Invoke(definition);
+    } catch (error) {
+        if (error instanceof ValidationError) {
+            throw new ServerError(ServerErrorCode.InvalidArguments, `Invalid command fields: ${error.message}`, error);
+        }
+        throw error;
+    }
+}
+
 function clusterSpecifierOf(entry: ClusterMapEntry): Specifier.ClusterLike {
     return ClusterType(entry.model) as Specifier.ClusterLike;
 }
@@ -243,6 +289,56 @@ class UnreachedAddressError extends Error {
     constructor(override readonly cause: unknown) {
         super("Commissioning at the supplied address failed");
     }
+}
+
+const UNSCOPED_INVOKES = {};
+
+/**
+ * Why device attestation refuses a device, as the text the client is shown, or `undefined` when no finding
+ * stops it. A test certificate gets an actionable hint; any other error-level finding is named with its check.
+ */
+export function attestationRefusalOf(findings: AttestationFinding[]): string | undefined {
+    if (findings.some(({ type }) => type === DeviceAttestationCheck.TrustedAsTestCertificate)) {
+        return 'This device uses a test/development certificate. To commission it, enable the "Test DCL" option in the settings — only do this if you trust the vendor.';
+    }
+    const errors = findings.filter(({ level }) => level === "error");
+    if (errors.length === 0) {
+        return undefined;
+    }
+    return `Device attestation refused: ${errors.map(({ type, message }) => `${type}: ${message}`).join("; ")}`;
+}
+
+/**
+ * The `NodeCommissionFailed` error for a failed commissioning, with a `reason` a client can act on. With
+ * `attestationRejected` the reason is `attestation-rejected`, whatever error the aborted commissioning raised.
+ */
+export function commissionFailureOf(error: unknown, attestationRejected: boolean): ServerError {
+    const cause = error instanceof Error ? error : undefined;
+    const failed = (
+        reason: CommissionFailureReason,
+        message = `Commission failed: ${cause?.message ?? String(error)}`,
+    ) => ServerError.nodeCommissionFailed(message, reason, cause);
+    if (attestationRejected) {
+        return failed("attestation-rejected");
+    }
+    // PASE rejects the device's key confirmation, which is what a mistyped pairing code looks
+    // like on the wire. Saying so lets a client offer the code again instead of a generic retry.
+    if (causedBy(error, PasscodeMismatchError)) {
+        return failed(
+            "passcode-mismatch",
+            "The pairing code does not match the device. Check the code and commission again.",
+        );
+    }
+    if (causedBy(error, TimeoutError, CommissioningTimeoutError, DiscoveryIncompleteError)) {
+        return failed("timeout");
+    }
+    if (causedBy(error, NoDiscoveryTransportError)) {
+        return failed("other");
+    }
+    if (causedBy(error, DiscoveryError)) {
+        return failed("not-discovered");
+    }
+    return failed("other");
 }
 
 export class ControllerCommandHandler {
@@ -256,6 +352,7 @@ export class ControllerCommandHandler {
     readonly #bleEnabled: boolean;
     readonly #bleProxyEnabled: boolean;
     readonly #otaEnabled: boolean;
+    readonly #autoSubscriptionDisabled: boolean;
     /** Node management and attribute cache */
     #nodes = new Nodes();
     /** Cache of available updates keyed by nodeId */
@@ -277,8 +374,12 @@ export class ControllerCommandHandler {
     #nodeUpdateDeadlines = new Map<NodeId, number>();
     /** Nodes with a lazy getNodeDetails populate in flight, so concurrent reads emit node_updated once. */
     #pendingLazyPopulate = new Set<NodeId>();
-    /** Track in-flight invoke-commands for deduplication across all WebSocket connections */
-    readonly #inFlightInvokes = new Map<string, Promise<unknown>>();
+    /** Failure callbacks of the enable_auto_subscription calls still waiting for the node's subscription. */
+    readonly #autoSubscribeWaiters = new WeakMap<ClientNode, Set<(error: Error) => void>>();
+    /** The setting of the last setAutoSubscription call, set before it reaches the node. */
+    readonly #autoSubscribeRequested = new WeakMap<ClientNode, boolean>();
+    /** In-flight invokes per dedup scope; a scope dropped by its owner takes its entries with it. */
+    readonly #inFlightInvokes = new WeakMap<object, Map<string, Promise<unknown>>>();
     events = {
         started: new AsyncObservable(),
         /** A removed attribute is reported with an `undefined` value. */
@@ -309,6 +410,7 @@ export class ControllerCommandHandler {
             timeSyncEnabled = false,
             threadDiagnosticsEnabled = false,
             customClusterPollInterval,
+            disableAutoSubscription = false,
         } = options;
 
         this.#node = controller.node;
@@ -321,9 +423,13 @@ export class ControllerCommandHandler {
         this.#bleProxyEnabled = bleProxyEnabled;
         logger.info(`BLE is ${bleEnabled ? "enabled" : "disabled"}${bleProxyEnabled ? " (proxy mode)" : ""}`);
         this.#otaEnabled = otaEnabled;
+        this.#autoSubscriptionDisabled = disableAutoSubscription;
+        if (disableAutoSubscription) {
+            logger.notice("Auto subscription is disabled; peers are only subscribed to when a client asks");
+        }
 
         const attributeReader: NodeAttributeReader = {
-            nodeConnected: peer => this.#isConnected(peer.nodeId),
+            nodeConnected: peer => this.#runsUpkeep(peer.nodeId),
             handleReadAttributes: (peer, paths, fabricFiltered) =>
                 this.handleReadAttributes(peer.nodeId, paths, fabricFiltered),
         };
@@ -340,7 +446,7 @@ export class ControllerCommandHandler {
             logger.info("Time synchronization enabled");
             this.#timeSyncManager = new TimeSyncManager({
                 syncTime: peer => this.#syncNodeTime(peer.nodeId),
-                nodeConnected: peer => this.#isConnected(peer.nodeId),
+                nodeConnected: peer => this.#runsUpkeep(peer.nodeId),
                 commissionedNodeCount: () => this.#node.peers.commissioned.length,
             });
         }
@@ -360,6 +466,23 @@ export class ControllerCommandHandler {
         return this.#nodes.has(nodeId) && this.#nodes.get(nodeId).lifecycle.isConnected;
     }
 
+    /**
+     * Whether polling, time sync and fabric label pushes reach the node. Off with auto subscription disabled, also for a
+     * node whose auto subscription was enabled, so the client alone decides what is sent to the devices.
+     */
+    #runsUpkeep(nodeId: NodeId): boolean {
+        return !this.#autoSubscriptionDisabled && this.#isConnected(nodeId);
+    }
+
+    #autoSubscribes(node: ClientNode): boolean {
+        return node.stateOf(NetworkClient).autoSubscribe;
+    }
+
+    /** Also true while a switch of the setting is still being applied, so a client subscription never runs beside it. */
+    #autoSubscribesOrWill(node: ClientNode): boolean {
+        return this.#autoSubscribes(node) || this.#autoSubscribeRequested.get(node) === true;
+    }
+
     /** Format a NodeId as a PeerAddress string for logging. */
     formatNode(nodeId: NodeId): string {
         return formatNodeId(nodeId, this.#fabricIndex);
@@ -377,13 +500,17 @@ export class ControllerCommandHandler {
         return this.#bleProxyEnabled;
     }
 
+    get autoSubscriptionDisabled() {
+        return this.#autoSubscriptionDisabled;
+    }
+
     async start() {
         if (this.#started) {
             return;
         }
         this.#started = true;
 
-        // Before the node comes online: bringing it up starts and subscribes every commissioned peer, and
+        // Before the node comes online: bringing it up starts every commissioned peer, and
         // a report arriving before the bus exists is not forwarded to anyone.
         this.#peers = this.#node.env.get(PeerSet);
         this.#startChangeBus();
@@ -405,7 +532,7 @@ export class ControllerCommandHandler {
      * rather than per node in {@link ControllerCommandHandler.#registerNode}.
      */
     #startChangeBus() {
-        const bus = new PeerChangeBus(this.#node);
+        const bus = new PeerChangeBus(this.#node, { reportWithoutSubscription: this.#autoSubscriptionDisabled });
         this.#changeBus = bus;
 
         // These run on one Observable shared by every peer; an uncaught throw would abort the emit and
@@ -535,8 +662,6 @@ export class ControllerCommandHandler {
                 return;
             }
 
-            // Access the SoftwareUpdateManager behavior events dynamically
-            // Using 'any' because SoftwareUpdateManager is not directly exported from @matter/node
             const softwareUpdateManagerEvents = await otaProvider.act(agent => agent.get(SoftwareUpdateManager).events);
             if (softwareUpdateManagerEvents === undefined) {
                 logger.info("SoftwareUpdateManager not available");
@@ -947,7 +1072,8 @@ export class ControllerCommandHandler {
         this.#nodeUpdateTimers.delete(nodeId);
 
         const connected = this.#isConnected(nodeId);
-        if (connected) {
+        // Without auto subscription a node is usually not connected, and reads are then the only source of its state.
+        if (this.#autoSubscriptionDisabled || connected) {
             await this.#nodes.attributeCache.update(node);
         }
         this.events.nodeStructureChanged.emit(nodeId);
@@ -1019,9 +1145,7 @@ export class ControllerCommandHandler {
     async interviewNode(nodeId: NodeId) {
         const node = this.#nodes.get(nodeId);
 
-        // Our nodes are kept up-to-date via attribute subscriptions, so we don't need
-        // to re-read all attributes like the Python server does. The caller is responsible
-        // for broadcasting node_updated after the interview completes.
+        // The caller is responsible for broadcasting node_updated after the interview completes.
         logger.info(`Interview requested for node ${this.formatNode(nodeId)} - do a complete read`);
 
         // Do a full Read of the node
@@ -1155,6 +1279,153 @@ export class ControllerCommandHandler {
     }
 
     /**
+     * Read with full control over the Matter request. Unlike {@link handleReadAttributes} the paths go out as one
+     * request, and only the data version filters the caller gives are sent.
+     * @throws {ServerError} with code InvalidArguments, before anything is sent, for a malformed path or invalid id, a
+     *   request without paths, an `eventMin` or data version out of range, or `eventMin` without event paths and data
+     *   version filters without attribute paths.
+     */
+    async read(request: InteractionReadRequest): Promise<InteractionReport> {
+        checkInteractionRequest(request);
+        const node = this.#nodes.get(request.nodeId);
+        const read = { ...this.#readOf(request), includeKnownVersions: true };
+        return this.#collectReport(request.nodeId, node.interaction.read(read));
+    }
+
+    /**
+     * Open a subscription of the caller's own. Only available with auto subscription disabled, and only for a node
+     * whose auto subscription was not enabled with {@link setAutoSubscription}. Reports reach
+     * {@link InteractionSubscriptionListener.report} except the priming report, which the result carries. matter.js ends
+     * the subscription when the node is removed or the controller goes offline.
+     * @throws {ServerError} with code InvalidArguments, before anything is sent, for the arguments {@link read} refuses
+     *   and for intervals outside 0 to 65535 seconds or a `maxInterval` below `minInterval`.
+     */
+    async subscribe(
+        request: InteractionSubscribeRequest,
+        listener: InteractionSubscriptionListener,
+    ): Promise<InteractionSubscription> {
+        const { nodeId, minInterval, maxInterval } = request;
+        if (!this.#autoSubscriptionDisabled) {
+            throw ServerError.invalidArguments("subscribe requires the server to run with --disable-auto-subscription");
+        }
+        checkInteractionRequest(request);
+        const node = this.#nodes.get(nodeId);
+        if (this.#autoSubscribesOrWill(node)) {
+            throw ServerError.invalidArguments(
+                `Node ${nodeId} has auto subscription enabled; subscribe requires disable_auto_subscription first`,
+            );
+        }
+
+        let priming: InteractionReport | undefined;
+        const subscribe: PlainClientSubscribe = {
+            ...this.#readOf(request),
+            includeKnownVersions: true,
+            keepSubscriptions: request.keepSubscriptions ?? false,
+            minIntervalFloor: Seconds(minInterval),
+            maxIntervalCeiling: Seconds(maxInterval),
+            // Draining the data is what applies it to the node state.
+            updated: async data => {
+                const report = await this.#collectReport(nodeId, data);
+                if (priming === undefined) {
+                    priming = report;
+                } else {
+                    listener.report(report);
+                }
+            },
+            closed: () => listener.closed(),
+        };
+        const active = await node.interaction.subscribe(subscribe);
+        if (priming === undefined) {
+            active.close();
+            throw new InternalError(`Subscription ${active.subscriptionId} became active without a priming report`);
+        }
+        // Auto subscription enabled while this was being set up would leave both subscriptions running.
+        if (this.#autoSubscribesOrWill(node)) {
+            active.close();
+            throw ServerError.invalidArguments(
+                `Node ${nodeId} had its auto subscription enabled while subscribing; the subscription was closed`,
+            );
+        }
+        return {
+            id: active.subscriptionId,
+            nodeId,
+            priming,
+            close: () => {
+                Promise.resolve(active.close()).catch(error =>
+                    logger.warn(`Failed to close subscription ${active.subscriptionId}:`, error),
+                );
+            },
+        };
+    }
+
+    #readOf(request: Omit<InteractionSubscribeRequest, "minInterval" | "maxInterval" | "keepSubscriptions">): Read {
+        const { attributePaths, eventPaths, eventMin, fabricFiltered = true, dataVersionFilters } = request;
+        return Read({
+            fabricFilter: fabricFiltered,
+            attributes: attributePaths?.length ? attributePaths.map(path => splitAttributePath(path)) : undefined,
+            events: eventPaths?.length
+                ? eventPaths.map(({ path, isUrgent }): EventPath => ({
+                      ...splitEventPath(path),
+                      isUrgent,
+                  }))
+                : undefined,
+            versionFilters: dataVersionFilters?.length
+                ? dataVersionFilters.map(({ path, dataVersion }): DataVersionFilter => {
+                      const { endpointId, clusterId } = splitAttributePath(path);
+                      if (endpointId === undefined || clusterId === undefined) {
+                          throw ServerError.invalidArguments(
+                              `Data version filter path "${path}" must name an endpoint and a cluster`,
+                          );
+                      }
+                      return { path: { endpointId, clusterId }, dataVersion };
+                  })
+                : undefined,
+            eventFilters: eventMin !== undefined ? [{ eventMin: EventNumber(eventMin) }] : undefined,
+        });
+    }
+
+    async #collectReport(nodeId: NodeId, data: ReadResult): Promise<InteractionReport> {
+        const report: InteractionReport = { attributes: {}, events: new Array<MatterNodeEvent>() };
+        for await (const chunk of data) {
+            for await (const entry of chunk) {
+                switch (entry.kind) {
+                    case "attr-value": {
+                        const { pathStr, value } = this.#convertAttributeToWebSocket(entry.path, entry.value);
+                        report.attributes[pathStr] = value;
+                        report.data_versions ??= {};
+                        report.data_versions[`${entry.path.endpointId}/${entry.path.clusterId}`] = entry.version;
+                        break;
+                    }
+                    case "event-value":
+                        report.events.push(
+                            convertEventToWebSocket(nodeId, entry.path, {
+                                eventNumber: entry.number,
+                                priority: entry.priority,
+                                epochTimestamp: entry.epochTimestamp,
+                                systemTimestamp: entry.systemTimestamp,
+                                data: entry.value,
+                            }),
+                        );
+                        break;
+                    case "attr-status": {
+                        const { endpointId, clusterId, attributeId } = entry.path;
+                        report.attribute_status ??= {};
+                        report.attribute_status[statusPathOf(endpointId, clusterId, attributeId)] = pathStatusOf(entry);
+                        break;
+                    }
+                    case "event-status": {
+                        const { endpointId, clusterId, eventId } = entry.path;
+                        report.event_status ??= {};
+                        report.event_status[statusPathOf(endpointId, clusterId, eventId)] = pathStatusOf(entry);
+                        break;
+                    }
+                }
+            }
+        }
+        return report;
+    }
+
+    /**
      * Convert attribute data to WebSocket tag-based format.
      */
     #convertAttributeToWebSocket(
@@ -1248,7 +1519,7 @@ export class ControllerCommandHandler {
      * unwinding the devices that did accept, which no amount of local bookkeeping can do.
      */
     async #pushFabricLabel(label: string) {
-        const connected = this.#nodes.getIds().filter(nodeId => this.#isConnected(nodeId));
+        const connected = this.#nodes.getIds().filter(nodeId => this.#runsUpkeep(nodeId));
         const results = await Promise.allSettled(
             connected.map(async nodeId => {
                 const response = await this.#nodes
@@ -1275,9 +1546,12 @@ export class ControllerCommandHandler {
         return this.#fabric.label;
     }
 
-    async handleWriteAttribute(data: WriteAttributeRequest): Promise<AttributeResponseStatus> {
-        const { nodeId, endpointId, clusterId, attributeId } = data;
-        let { value } = data;
+    /**
+     * A concrete, untimed write goes through the node's state, which also updates the node data at once. A wildcard
+     * endpoint or a timed write is sent as a plain Write; the node data then changes only with the next report.
+     */
+    async handleWriteAttribute(data: WriteAttributeRequest): Promise<AttributeResponseStatus[]> {
+        const { nodeId, endpointId, clusterId, attributeId, timedInteractionTimeoutMs } = data;
 
         const clusterEntry = ClusterMap[clusterId];
         const attributeModel = clusterEntry?.attributes[attributeId];
@@ -1285,18 +1559,71 @@ export class ControllerCommandHandler {
             throw ServerError.invalidArguments(`Attribute ${attributeId} on cluster ${clusterId} unknown`);
         }
 
-        value = convertWebSocketTagBasedToMatter(value, attributeModel, clusterEntry.model);
-
+        const value = convertWebSocketTagBasedToMatter(data.value, attributeModel, clusterEntry.model);
         const attributeName = attributeModel.propertyName;
-        logger.info(`Writing attribute ${clusterId}.${attributeName} (${clusterId}.${attributeId}) with value`, value);
-        const { status, clusterStatus } = await this.#writeAttribute(
-            nodeId,
-            endpointId,
-            clusterId,
-            attributeModel.propertyName,
+        logger.info(
+            `Writing attribute ${clusterId}.${attributeName} (${endpointId ?? "*"}/${clusterId}/${attributeId}) with value`,
             value,
         );
-        return { attributeId, clusterId, endpointId, status, clusterStatus };
+
+        if (endpointId !== undefined && timedInteractionTimeoutMs === undefined) {
+            const { status, clusterStatus } = await this.#writeAttribute(
+                nodeId,
+                endpointId,
+                clusterId,
+                attributeName,
+                value,
+            );
+            return [{ attributeId, clusterId, endpointId, status, clusterStatus }];
+        }
+        if (endpointId !== undefined) {
+            this.#clusterEndpoint(nodeId, endpointId, clusterEntry.model.propertyName);
+        }
+
+        const attribute = { cluster: clusterSpecifierOf(clusterEntry), attributes: attributeName, value };
+        try {
+            const write = Write(
+                {
+                    timed: timedInteractionTimeoutMs !== undefined,
+                    timeout: timedInteractionTimeoutMs,
+                    // A device expands a wildcard path per endpoint, which leaves list append chunks without a base.
+                    chunkLists: endpointId !== undefined,
+                },
+                Write.Attribute(endpointId === undefined ? attribute : { ...attribute, endpoint: endpointId }),
+            );
+            const results = await this.#nodes.get(nodeId).interaction.write(write);
+
+            // A chunked list write answers once per chunk; report each endpoint once, its first failure if any.
+            const byEndpoint = new Map<number, AttributeResponseStatus>();
+            for (const { path, status, clusterStatus } of results) {
+                const known = byEndpoint.get(path.endpointId);
+                if (known === undefined || (known.status === Status.Success && status !== Status.Success)) {
+                    byEndpoint.set(path.endpointId, {
+                        endpointId: path.endpointId,
+                        clusterId: path.clusterId,
+                        attributeId: path.attributeId,
+                        status,
+                        clusterStatus,
+                    });
+                }
+            }
+            return [...byEndpoint.values()];
+        } catch (error) {
+            if (!(error instanceof StatusResponseError)) {
+                throw error;
+            }
+            if (endpointId !== undefined) {
+                return [{ endpointId, clusterId, attributeId, status: error.code, clusterStatus: error.clusterCode }];
+            }
+            if (error instanceof ReceivedStatusResponseError) {
+                throw error;
+            }
+            throw new ServerError(
+                ServerErrorCode.InvalidArguments,
+                `Invalid value for ${attributeName}: ${error.message}`,
+                error,
+            );
+        }
     }
 
     async #invokeCommand<const C extends Specifier.ClusterLike>(
@@ -1313,17 +1640,14 @@ export class ControllerCommandHandler {
         request: Invoke.CommandRequest<C>,
         options: Omit<Invoke.Definition, "commands"> = {},
     ) {
-        const invoke = Invoke({
-            commands: [request],
-            ...options,
-        });
+        const invoke = invokeRequestOf({ commands: [request], ...options });
         for await (const data of node.interaction.invoke(invoke)) {
             for (const entry of data) {
                 // We send only one command, so we only get one response back
                 switch (entry.kind) {
                     case "cmd-status":
                         if (entry.status !== Status.Success) {
-                            throw StatusResponseError.create(entry.status, undefined, entry.clusterStatus);
+                            throw ResultStatus.errorOf(entry);
                         }
                         return;
 
@@ -1340,7 +1664,9 @@ export class ControllerCommandHandler {
     }
 
     /** Resolves once the packet is sent: no node answers. Each node's group table decides which endpoints act. */
-    async handleGroupWriteAttribute(data: Omit<WriteAttributeRequest, "endpointId">): Promise<void> {
+    async handleGroupWriteAttribute(
+        data: Omit<WriteAttributeRequest, "endpointId" | "timedInteractionTimeoutMs">,
+    ): Promise<void> {
         const { nodeId, clusterId, attributeId } = data;
 
         const clusterEntry = ClusterMap[clusterId];
@@ -1412,6 +1738,94 @@ export class ControllerCommandHandler {
         });
     }
 
+    /** Checks that the node has the command and converts its fields from the WebSocket form. */
+    #commandRequestOf(
+        nodeId: NodeId,
+        endpointId: EndpointNumber,
+        clusterId: ClusterId,
+        commandName: string,
+        commandData: unknown,
+    ) {
+        const clusterEntry = ClusterMap[clusterId];
+        if (!clusterEntry) {
+            throw ServerError.invalidArguments(`Cluster Id "${clusterId}" unknown`);
+        }
+        const clusterName = clusterEntry.model.propertyName;
+        const command = camelize(commandName);
+        const endpoint = this.#clusterEndpoint(nodeId, endpointId, clusterName);
+        const commands = (endpoint.commands as Record<string, Record<string, unknown>>)[clusterName];
+        const model = clusterEntry.commands[command.toLowerCase()];
+        if (!model || !commands[command]) {
+            throw ServerError.invalidArguments(`Command "${command}" does not exist on cluster "${clusterName}"`);
+        }
+
+        let fields = commandData;
+        if (isObject(fields)) {
+            fields =
+                Object.keys(fields).length === 0
+                    ? undefined
+                    : convertCommandDataToMatter(fields, model, clusterEntry.model);
+        }
+        return { cluster: clusterSpecifierOf(clusterEntry), clusterName, command, fields };
+    }
+
+    /**
+     * Sends all commands in one InvokeRequest, never split and never combined with other invokes, so a device sees
+     * exactly the batch the client asked for.
+     */
+    async handleBatchedInvoke(data: BatchedInvokeRequest): Promise<BatchedInvokeResult> {
+        const { nodeId, commands, timedInteractionTimeoutMs, interactionTimeoutMs } = data;
+        if (commands.length === 0) {
+            throw ServerError.invalidArguments("batched_device_commands needs at least one command");
+        }
+        const requests = commands.map(({ endpointId, clusterId, commandName, data }, commandRef) => {
+            const { cluster, command, fields } = this.#commandRequestOf(
+                nodeId,
+                endpointId,
+                clusterId,
+                commandName,
+                data,
+            );
+            return { endpoint: endpointId, cluster, command, fields, commandRef };
+        });
+
+        const node = this.#nodes.get(nodeId);
+        const { peerAddress } = node;
+        const peer = peerAddress === undefined ? undefined : this.#peers?.get(peerAddress);
+        const maxPathsPerInvoke = peer?.sessionParameters.maxPathsPerInvoke ?? 1;
+        if (requests.length > maxPathsPerInvoke) {
+            throw ServerError.invalidArguments(
+                `batched_device_commands has ${requests.length} commands, but node ${this.formatNode(nodeId)} accepts at most ${maxPathsPerInvoke} per invoke (its MaxPathsPerInvoke, 1 when it reports none)`,
+            );
+        }
+
+        const invoke = invokeRequestOf({
+            commands: requests,
+            // `timed: false` would also drop the timed request a command requires on its own.
+            ...(timedInteractionTimeoutMs !== undefined && { timed: true, timeout: timedInteractionTimeoutMs }),
+            expectedProcessingTime: interactionTimeoutMs,
+        });
+        const answers = new Map<number | undefined, BatchedInvokeResult[number]>();
+        for await (const chunk of node.interaction.invoke({ ...invoke, batchDuration: false })) {
+            for (const entry of chunk) {
+                answers.set(
+                    entry.commandRef,
+                    entry.kind === "cmd-status"
+                        ? { status: entry.status, clusterStatus: entry.clusterStatus }
+                        : { status: Status.Success, data: entry.data },
+                );
+            }
+        }
+        // matter.js answers every command, with NoCommandResponse for one the device left out.
+        return requests.map(({ commandRef }) => {
+            const answer = answers.get(commandRef);
+            if (answer === undefined) {
+                throw new InternalError(`No answer for command ${commandRef} of a batched invoke`);
+            }
+            return answer;
+        });
+    }
+
     async handleInvoke(data: InvokeRequest): Promise<unknown> {
         const {
             nodeId,
@@ -1420,37 +1834,23 @@ export class ControllerCommandHandler {
             timedInteractionTimeoutMs: timedRequestTimeoutMs,
             interactionTimeoutMs,
         } = data;
-        let { data: commandData } = data;
 
-        const clusterEntry = ClusterMap[clusterId];
-        if (!clusterEntry) {
-            throw ServerError.invalidArguments(`Cluster Id "${clusterId}" unknown`);
-        }
-        const clusterName = clusterEntry.model.propertyName;
-        const commandName = camelize(data.commandName);
-        const endpoint = this.#clusterEndpoint(nodeId, endpointId, clusterName);
-        const commands = (endpoint.commands as Record<string, Record<string, unknown>>)[clusterName];
-        if (!commands[commandName]) {
-            throw ServerError.invalidArguments(`Command "${commandName}" does not exist on cluster "${clusterName}"`);
-        }
-
-        if (isObject(commandData)) {
-            if (Object.keys(commandData).length === 0) {
-                commandData = undefined;
-            } else {
-                const model = clusterEntry.commands[commandName.toLowerCase()];
-                if (model) {
-                    commandData = convertCommandDataToMatter(commandData, model, clusterEntry.model);
-                }
-            }
-        }
+        const request = this.#commandRequestOf(nodeId, endpointId, clusterId, data.commandName, data.data);
+        const { command: commandName, fields: commandData } = request;
+        const clusterName = request.clusterName;
 
         // Build dedup key from validated/converted fields
         const serializedData = commandData !== undefined ? toBigIntAwareJson(commandData) : "";
-        const dedupKey = `${nodeId}:${endpointId}:${clusterId}:${commandName}:${serializedData}`;
+        const dedupKey = `${nodeId}:${endpointId}:${clusterId}:${commandName}:${data.timedInteractionTimeoutMs ?? ""}:${data.interactionTimeoutMs ?? ""}:${serializedData}`;
+        const scope = data.dedupScope ?? UNSCOPED_INVOKES;
+        let inFlight = this.#inFlightInvokes.get(scope);
+        if (inFlight === undefined) {
+            inFlight = new Map();
+            this.#inFlightInvokes.set(scope, inFlight);
+        }
 
         // Check for in-flight duplicate
-        const existing = this.#inFlightInvokes.get(dedupKey);
+        const existing = inFlight.get(dedupKey);
         if (existing !== undefined) {
             logger.warn(
                 `Duplicate command detected for ${this.formatNode(nodeId)}/${endpointId}/${clusterName}/${commandName} - coalescing with in-flight request`,
@@ -1458,50 +1858,52 @@ export class ControllerCommandHandler {
             return existing;
         }
 
-        const cluster = clusterSpecifierOf(clusterEntry);
-
         // Execute and track the command
         const invokePromise = this.#invokeCommand(
             this.#nodes.get(nodeId),
+            { endpoint: endpointId, cluster: request.cluster, command: commandName, fields: commandData },
             {
-                endpoint: endpointId,
-                cluster,
-                command: commandName,
-                fields: commandData,
-            },
-            {
-                timeout: timedRequestTimeoutMs !== undefined ? Millis(timedRequestTimeoutMs) : undefined,
+                // matter.js sends a timed request only for a non-zero timeout unless `timed` says so.
+                ...(timedRequestTimeoutMs !== undefined && { timed: true, timeout: Millis(timedRequestTimeoutMs) }),
                 expectedProcessingTime: interactionTimeoutMs !== undefined ? Millis(interactionTimeoutMs) : undefined,
             },
         );
 
         // Store the in-flight invoke immediately so concurrent requests can see it
-        this.#inFlightInvokes.set(dedupKey, invokePromise);
+        inFlight.set(dedupKey, invokePromise);
 
         // Ensure cleanup of the in-flight entry once the invoke completes
         return invokePromise.finally(() => {
-            this.#inFlightInvokes.delete(dedupKey);
+            inFlight.delete(dedupKey);
         });
     }
 
-    #determineCommissionOptions(data: CommissioningRequest): CommissioningDiscovery.Options {
+    #determineCommissionOptions(
+        data: CommissioningRequest,
+        attestation: { rejected: boolean },
+    ): CommissioningDiscovery.Options {
         let passcode: number | undefined = undefined;
         let shortDiscriminator: number | undefined = undefined;
         let longDiscriminator: number | undefined = undefined;
         let productId: number | undefined = undefined;
         let vendorId: VendorId | undefined = undefined;
+        let deviceType: number | undefined = undefined;
 
         if ("manualCode" in data && data.manualCode.length > 0) {
-            const pairingCodeCodec = ManualPairingCodeCodec.decode(data.manualCode);
+            const pairingCodeCodec = decodeManualCode(data.manualCode);
             shortDiscriminator = pairingCodeCodec.shortDiscriminator;
             longDiscriminator = undefined;
             passcode = pairingCodeCodec.passcode;
+            ({ vendorId, productId } = pairingCodeCodec);
         } else if ("qrCode" in data && data.qrCode.length > 0) {
-            const pairingCodeCodec = QrPairingCodeCodec.decode(data.qrCode);
+            const pairingCodeCodec = decodeQrCode(data.qrCode);
             // TODO handle the case where multiple devices are included
             longDiscriminator = pairingCodeCodec[0].discriminator;
             shortDiscriminator = undefined;
             passcode = pairingCodeCodec[0].passcode;
+            const stated = pairingCodeCodec[0];
+            vendorId = stated.vendorId === undefined ? undefined : VendorId(stated.vendorId);
+            productId = stated.productId;
         } else if ("passcode" in data) {
             passcode = data.passcode;
             // Check for discriminator-based discovery
@@ -1509,9 +1911,11 @@ export class ControllerCommandHandler {
                 shortDiscriminator = data.shortDiscriminator;
             } else if ("longDiscriminator" in data) {
                 longDiscriminator = data.longDiscriminator;
-            } else if ("vendorId" in data && "productId" in data) {
+            } else if ("vendorId" in data) {
                 vendorId = VendorId(data.vendorId);
                 productId = data.productId;
+            } else if ("deviceType" in data) {
+                deviceType = data.deviceType;
             }
             // If none of the above, discovers any commissionable device
         } else {
@@ -1529,36 +1933,33 @@ export class ControllerCommandHandler {
                 ? { longDiscriminator }
                 : shortDiscriminator !== undefined
                   ? { shortDiscriminator }
-                  : vendorId !== undefined
-                    ? { vendorId, productId }
-                    : {}),
+                  : {}),
+            // Discovery searches by discriminator; matter.js uses vendor and product to pass over a device advertising others.
+            ...(vendorId !== undefined ? { vendorId } : {}),
+            ...(vendorId !== undefined && productId !== undefined ? { productId } : {}),
+            ...(deviceType !== undefined ? { deviceType } : {}),
             discoveryCapabilities: {
                 ble: this.bleEnabled && !onNetworkOnly,
                 onIpNetwork: true,
             },
             nodeId: data.nodeId,
+            autoSubscribe: !this.#autoSubscriptionDisabled,
             regulatoryLocation: GeneralCommissioning.RegulatoryLocationType.IndoorOutdoor,
             regulatoryCountryCode: "XX",
             wifiNetwork,
             threadNetwork,
             onAttestationFailure: (findings: AttestationFinding[]) => {
-                let testCertReason: string | undefined;
-                let hardError = false;
                 for (const f of findings) {
-                    if (f.type === DeviceAttestationCheck.TrustedAsTestCertificate) {
-                        testCertReason =
-                            'This device uses a test/development certificate. To commission it, enable the "Test DCL" option in the settings — only do this if you trust the vendor.';
-                    } else if (f.level === "error") {
-                        hardError = true;
-                    }
                     logger.info(`Attestation finding (${f.level}):`, f.type, f.message);
                 }
-                if (testCertReason !== undefined) {
-                    logger.notice(`Attestation rejected: ${testCertReason}`);
-                    return testCertReason;
+                const refusal = attestationRefusalOf(findings);
+                attestation.rejected = refusal !== undefined;
+                if (refusal === undefined) {
+                    logger.info("Attestation accepted");
+                    return true;
                 }
-                logger.info(`Attestation ${hardError ? "rejected" : "accepted"}`);
-                return !hardError;
+                logger.notice(refusal);
+                return refusal;
             },
         };
     }
@@ -1590,7 +1991,8 @@ export class ControllerCommandHandler {
     }
 
     async commissionNode(data: CommissioningRequest): Promise<CommissioningResponse> {
-        const options = this.#determineCommissionOptions(data);
+        const attestation = { rejected: false };
+        const options = this.#determineCommissionOptions(data, attestation);
         const { knownAddress } = data;
 
         let nodeId: NodeId;
@@ -1611,7 +2013,9 @@ export class ControllerCommandHandler {
                     );
                 }
             }
-            peer ??= await this.#node.peers.commission(options);
+            peer ??= await this.#node.peers.commission(
+                data.discoveryTimeout === undefined ? options : { ...options, timeout: data.discoveryTimeout },
+            );
             await awaitSeeded(peer, this.#shutdown);
             nodeId = nodeIdOf(peer);
 
@@ -1619,20 +2023,7 @@ export class ControllerCommandHandler {
             // command, not an unmapped throw with a node the server tracks and never announced.
             await this.#registerNode(nodeId, false);
         } catch (error) {
-            // PASE rejects the device's key confirmation, which is what a mistyped pairing code looks
-            // like on the wire. Saying so lets a client offer the code again instead of a generic retry.
-            if (error instanceof Error && causedBy(error, PasscodeMismatchError)) {
-                throw ServerError.nodeCommissionFailed(
-                    "The pairing code does not match the device. Check the code and commission again.",
-                    error,
-                );
-            }
-            // Preserve the original error message with context
-            const originalMessage = error instanceof Error ? error.message : String(error);
-            throw ServerError.nodeCommissionFailed(
-                `Commission failed: ${originalMessage}`,
-                error instanceof Error ? error : undefined,
-            );
+            throw commissionFailureOf(error, attestation.rejected);
         }
 
         this.events.nodeAdded.emit(nodeId);
@@ -1833,9 +2224,10 @@ export class ControllerCommandHandler {
         // A reachable device must be told to drop our fabric, or it keeps holding it and never becomes
         // commissionable again without a manual factory reset. An unreachable one cannot be told
         // anything, and attempting it costs the caller the full discovery and retry budget, so go
-        // straight to the local removal for those.
+        // straight to the local removal for those. Without auto subscription a node is usually not connected,
+        // so reachability is unknown and the device is always tried.
         let removed = false;
-        if (this.#isConnected(nodeId)) {
+        if (this.#autoSubscriptionDisabled || this.#isConnected(nodeId)) {
             try {
                 await node.decommission();
                 removed = true;
@@ -1971,13 +2363,123 @@ export class ControllerCommandHandler {
 
     /**
      * Drop the local ICD registration and reconnect; a LIT peer re-registers automatically once subscribed.
+     * With auto subscription disabled, and not enabled for the node, only the local registration is dropped. The last
+     * {@link setAutoSubscription} call for the node decides the final setting, also one made while this runs.
      */
     async resyncIcd(nodeId: NodeId): Promise<void> {
         const node = this.#nodes.get(nodeId);
         await node.act(agent => agent.get(IcdClient).forget());
+        if (!this.#keepsAutoSubscription(node)) {
+            return;
+        }
         // Tearing the sustained subscription down and back up is what forces the re-registration.
         await node.set({ network: { autoSubscribe: false } });
-        await node.set({ network: { autoSubscribe: true } });
+        if (!this.#keepsAutoSubscription(node)) {
+            return;
+        }
+        try {
+            await node.set({ network: { autoSubscribe: true } });
+        } catch (error) {
+            this.#failAutoSubscribeWaiters(
+                node,
+                ServerError.nodeNotReady(nodeId, error instanceof Error ? error : undefined),
+            );
+            throw error;
+        }
+    }
+
+    /**
+     * Switch the server's own subscription to one node on or off. Only available with auto subscription disabled, and
+     * not kept across a restart. Enabling resolves once the subscription is active and ends the node's client
+     * subscriptions, because the server's subscription does not keep other subscriptions. It fails when matter.js finds
+     * the device unreachable while waiting, after {@link DEFAULT_CASE_CONNECTION_TIMEOUT}, or when the node is removed,
+     * switched off with this method or the handler closes. Except when switched off, the setting stays enabled and
+     * matter.js keeps trying.
+     */
+    async setAutoSubscription(nodeId: NodeId, enabled: boolean): Promise<void> {
+        if (!this.#autoSubscriptionDisabled) {
+            throw ServerError.invalidArguments(
+                `${enabled ? "enable" : "disable"}_auto_subscription requires the server to run with --disable-auto-subscription`,
+            );
+        }
+        const node = this.#nodes.get(nodeId);
+        this.#autoSubscribeRequested.set(node, enabled);
+        if (!enabled) {
+            this.#failAutoSubscribeWaiters(
+                node,
+                ServerError.nodeNotReady(nodeId, new Error("auto subscription was disabled while waiting")),
+            );
+            await node.set({ network: { autoSubscribe: false } });
+            return;
+        }
+
+        let settle!: (error: Error | undefined) => void;
+        const outcome = new Promise<Error | undefined>(resolve => (settle = resolve));
+        let waiters = this.#autoSubscribeWaiters.get(node);
+        if (waiters === undefined) {
+            waiters = new Set();
+            this.#autoSubscribeWaiters.set(node, waiters);
+        }
+        waiters.add(settle);
+        const observers = new ObserverGroup();
+        observers.on(node.eventsOf(NetworkClient).subscriptionStatusChanged, isActive => {
+            if (isActive) {
+                settle(undefined);
+            }
+        });
+        // Only a change counts: an older unreachable mark stays until a session comes up and says nothing about now.
+        observers.on(node.lifecycle.connectionStateChanged, state => {
+            if (state === NodeConnectionState.WaitingForDeviceDiscovery) {
+                settle(ServerError.nodeNotResolving(nodeId, new Error("the device is unreachable")));
+            }
+        });
+        observers.on(this.events.nodeDecommissioned, removed => {
+            if (removed === nodeId) {
+                settle(ServerError.nodeNotExists(nodeId));
+            }
+        });
+        const abort = new Abort({
+            abort: this.#shutdown,
+            timeout: DEFAULT_CASE_CONNECTION_TIMEOUT,
+            timeoutHandler() {
+                const timeout = Duration.format(DEFAULT_CASE_CONNECTION_TIMEOUT);
+                this.abort(
+                    ServerError.nodeNotReady(nodeId, new Error(`the subscription was not active within ${timeout}`)),
+                );
+            },
+            handler: reason => settle(reason),
+        });
+        try {
+            try {
+                await node.set({ network: { autoSubscribe: true } });
+            } catch (error) {
+                if (this.#autoSubscribeRequested.get(node) === true) {
+                    this.#autoSubscribeRequested.set(node, this.#autoSubscribes(node));
+                }
+                throw error;
+            }
+            if (await node.act(agent => agent.get(NetworkClient).subscriptionActive)) {
+                settle(undefined);
+            }
+            const error = await outcome;
+            if (error !== undefined) {
+                throw error;
+            }
+        } finally {
+            waiters.delete(settle);
+            observers.close();
+            abort.close();
+        }
+    }
+
+    #keepsAutoSubscription(node: ClientNode) {
+        return !this.#autoSubscriptionDisabled || this.#autoSubscribeRequested.get(node) === true;
+    }
+
+    #failAutoSubscribeWaiters(node: ClientNode, error: Error) {
+        for (const fail of this.#autoSubscribeWaiters.get(node) ?? []) {
+            fail(error);
+        }
     }
 
     async getIcdState(nodeId: NodeId): Promise<IcdStateData> {

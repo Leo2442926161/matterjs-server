@@ -71,11 +71,13 @@ export class PeerChangeBus {
     /** Endpoints already resolved to the controller itself, so its own changes don't re-walk either. */
     #notAPeer = new WeakSet<Endpoint>();
     /**
-     * Peers whose first subscription has been established. Latched, never cleared: the seeding read
+     * Peers whose changes are forwarded: from their first established subscription, or from the start with
+     * `reportWithoutSubscription`. Latched, never cleared: the seeding read
      * reports every attribute of every endpoint, and forwarding that would flood consumers with an
      * update per attribute on every startup.
      */
     #reporting = new WeakSet<ClientNode>();
+    readonly #reportWithoutSubscription: boolean;
     /**
      * Peers being destroyed. Their endpoint tree is torn down depth-first, emitting a deletion per
      * endpoint, which must not reach consumers as individual endpoint removals.
@@ -90,7 +92,12 @@ export class PeerChangeBus {
         reportingStarted: new Observable<[nodeId: NodeId]>(),
     };
 
-    constructor(controller: ServerNode) {
+    /**
+     * @param options.reportWithoutSubscription forward every peer's changes from the start. For a controller that
+     * does not subscribe on its own, where explicit reads can be the only changes and there is no startup seeding read.
+     */
+    constructor(controller: ServerNode, options: { reportWithoutSubscription?: boolean } = {}) {
+        this.#reportWithoutSubscription = options.reportWithoutSubscription ?? false;
         this.#observers.on(controller.env.get(ChangeNotificationService).change, change => {
             // Shared Observable: an uncaught throw here aborts the emit, starving every later observer.
             try {
@@ -118,7 +125,7 @@ export class PeerChangeBus {
     }
 
     #watch(peer: ClientNode) {
-        if (peer.lifecycle.connectionState === NodeConnectionState.Connected) {
+        if (this.#reportWithoutSubscription || peer.lifecycle.connectionState === NodeConnectionState.Connected) {
             this.#reporting.add(peer);
         }
         const observers = new ObserverGroup();

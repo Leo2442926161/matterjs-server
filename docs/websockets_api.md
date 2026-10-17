@@ -54,6 +54,25 @@ Error responses:
 }
 ```
 
+Optional fields of an error response (schema 14):
+
+- `status` and `cluster_status`: when the failure is a Matter status that matter.js reports as received from the
+  device, the numeric Matter status code and, if the device sent one, the cluster-specific status code. This is
+  always the case for a `device_command` the device rejected, for example with `UNSUPPORTED_COMMAND` (0x81), and for
+  any command whose whole interaction the device answered with a status. matter.js does not mark the status of a
+  command the server sends on its own behalf (for example to open a commissioning window or remove a fabric), so
+  those failures carry no `status`. Neither do arguments the server rejects before anything is sent. `error_code`
+  stays as it was.
+- `reason`: why commissioning failed, with every `NodeCommissionFailed` error of `commission_with_code` and
+  `commission_on_network`, and with a pairing code that cannot be decoded. Other argument errors carry no `reason`.
+  - `not-discovered`: no matching device was found.
+  - `passcode-mismatch`: the device rejected the pairing code.
+  - `invalid-payload`: the pairing code could not be decoded; `error_code` is `InvalidArguments`.
+  - `attestation-rejected`: the device certificates were not accepted.
+  - `timeout`: a device was found but not reached in time, an attempt to reach it timed out, the device stopped
+    answering, or commissioning took too long.
+  - `other`: anything else, for example an attempt that failed with an error other than a timeout.
+
 ## Commands
 
 ### Server Information
@@ -312,9 +331,15 @@ Using manual pairing code (network only):
 }
 ```
 
+`discovery_timeout_s` (optional, schema 14) limits, in seconds, how long the server has to find the device and to set
+up the PASE session with it. Allowed are numbers above 0 up to 172800 (48 hours, the longest a device announces for
+commissioning); `null` counts as not given. Without it matter.js searches for 3 minutes. The commissioning steps after PASE are not
+limited. A device that is found but not reached in time fails with `NodeCommissionFailed` and `reason` `timeout`; a device
+never found, with `reason` `not-discovered`.
+
 **commission_on_network** - Commission a device already on the network
 
-Commission using setup PIN code with optional filtering by discriminator or vendor ID.
+Commission using setup PIN code with optional filtering by discriminator, vendor ID, product or device type.
 
 ```json
 {
@@ -334,6 +359,58 @@ Filter types:
 - `1` - Short discriminator
 - `2` - Long discriminator
 - `3` - Vendor ID
+- `4` - Device type
+
+`discovery_timeout_s` works as for `commission_with_code`. The attempt at `ip_addr` keeps the PASE limit of matter.js;
+the timeout applies to the discovery that follows when that attempt fails.
+
+**parse_onboarding_payload** *(schema 14+)* - Decode a QR code payload or a manual pairing code
+
+Decodes the code the way `commission_with_code` reads it, without contacting any device and without changing any
+state.
+
+```json
+{
+  "message_id": "1",
+  "command": "parse_onboarding_payload",
+  "args": { "code": "MT:Y.K90AFN00KA0648G00" }
+}
+```
+
+- `code` (required, string): a QR code payload (starting with `MT:`) or an 11- or 21-digit manual pairing code.
+
+Response for a QR code, one entry per payload, so a code that concatenates several payloads returns several:
+
+```json
+{
+  "type": "qr",
+  "payloads": [
+    {
+      "version": 0,
+      "vendor_id": 65521,
+      "product_id": 32768,
+      "flow_type": 0,
+      "discovery_capabilities": 4,
+      "discriminator": 3840,
+      "setup_pin_code": 20202021
+    }
+  ]
+}
+```
+
+`vendor_id` and `product_id` are left out where the payload says 0 (unspecified). `flow_type` is 0 standard, 1
+user-intent, 2 custom. `discovery_capabilities` is the bitmask as encoded in the payload. TLV data appended to the
+payload is not returned.
+
+Response for a manual pairing code; `vendor_id` and `product_id` only for the 21-digit form, and left out where it says 0:
+
+```json
+{ "type": "manual", "short_discriminator": 15, "setup_pin_code": 20202021 }
+```
+
+A code that cannot be decoded fails with `InvalidArguments` (8) and `reason` `invalid-payload`, as in
+`commission_with_code`. A missing or non-string `code` fails with `InvalidArguments` without `reason`. An unexpected
+error while decoding fails with `SDKStackError` (7) without `reason`.
 
 **open_commissioning_window** - Open commissioning window to share a device
 
@@ -417,6 +494,11 @@ from Matter-over-Thread commissioning and can be turned off entirely with `--dis
 Issuing either Thread command opts the connection in to `thread_diagnostics_updated` events (see
 Events); a client that never queries Thread data never receives them.
 
+With `--disable-auto-subscription` the server does not discover Border Routers on its own: the first
+`get_thread_border_routers`, `get_thread_diagnostics` or `get_network_topology` starts the discovery, so that first
+call can return no Border Routers or diagnostics yet. A `get_thread_diagnostics` with `ext_pan_id` that starts the
+discovery returns `null` instead of reporting the Border Router as unreachable; repeat it once discovery found it.
+
 ### Network Topology
 
 **get_network_topology** *(schema 13+)* - Return the whole Matter network as a graph
@@ -439,6 +521,12 @@ The response is a `NetworkTopology` (`{ collected_at, nodes[], connections[] }`)
 strength values, and `packages/ws-client/src/models/model.ts` for the exact wire shape.
 
 ### Attribute Operations
+
+> [!NOTE]
+> When the server runs with `--disable-auto-subscription`, it does not subscribe to nodes, so there are no
+> automatic `attribute_updated` or node events from device reports. You are responsible for subscribing as needed,
+> or for switching the server's subscription on per node with `enable_auto_subscription` (see
+> [Subscriptions and generic read](#subscriptions-and-generic-read)); only recommended for very special use cases. See [CLI: Disabled auto subscription](cli.md#disabled-auto-subscription).
 
 **read_attribute** - Read attribute(s) from a node
 
@@ -494,12 +582,32 @@ Wildcard (all attributes from OnOff cluster):
 }
 ```
 
-Response: one entry for the path written, `[{ "Path": { ... }, "Status": 0 }]`. Every call sends a write
-request to the node, also when the value equals the cached one, and `Status` is the status the node
-answered. A value of the wrong type, outside the attribute's constraints or missing a mandatory field is
-refused before sending, with `Status` `141` (INVALID_DATA_TYPE), `135` (CONSTRAINT_ERROR) or `128`
-(INVALID_ACTION). A write to an imported test node reports
-`0` without a device having answered.
+Schema 14 options:
+
+- `*` as the endpoint (`"*/6/16385"`) writes the attribute on every endpoint of the node that has it, in one Write
+  request; the device decides which endpoints it reaches. A wildcard cluster or attribute is refused with
+  `InvalidArguments`, and so is a path to a node that is not three segments of digits or `*`.
+- `timed_request_timeout_ms`: sends the write as a timed write with this timeout, an integer from 0 to 65535;
+  otherwise the request fails with `InvalidArguments`. 0 counts as not given. Without it, a write is timed only when
+  the attribute requires it.
+
+Response: one entry per endpoint the device answered for (one for a specific endpoint, one per endpoint reached for a
+wildcard endpoint, none when a wildcard reaches no endpoint), with its Matter status in `Status` and, when the device
+sent one, the cluster-specific status in `ClusterStatus` (schema 14). Every call sends a write request to the node,
+also when the value equals the current one. A list written in several chunks still gets one entry per endpoint, with
+the first failing chunk's status. A value of the wrong type, outside the attribute's constraints or missing a mandatory
+field fails with `Status` `141` (INVALID_DATA_TYPE), `135` (CONSTRAINT_ERROR) or `128` (INVALID_ACTION). For a
+wildcard endpoint, a value matter.js cannot encode fails with `InvalidArguments` instead, and a status for the whole
+Write is an error reply. A write to an imported test node reports `0` without a device having answered; a test node
+takes no wildcard endpoint.
+
+A write to a specific endpoint without `timed_request_timeout_ms` also updates the node data at once. A wildcard or
+timed write changes the node data only with the device's next report, so without a subscription it stays unchanged
+until the next read.
+
+```json
+[{ "Path": { "EndpointId": 1, "ClusterId": 6, "AttributeId": 16385 }, "Status": 0 }]
+```
 
 A `node_id` in the Group Node ID range multicasts the write to the group. The endpoint must then be the
 wildcard — `"*/6/16385"` — because a groupcast carries no endpoint: each node's own group table decides
@@ -507,11 +615,253 @@ which of its endpoints the write reaches. The response is `null`, not a status l
 sent with the response suppressed, so no node answers and there is no status to report. Nothing reports
 back, so a groupcast write that every node rejects — a read-only attribute, an attribute none of them
 has — is answered exactly like one they all applied. A wildcard cluster or attribute is refused for a
-group as it is for a node.
+group as it is for a node, and so is `timed_request_timeout_ms`.
+
+### Subscriptions and generic read
+
+Schema 14. These commands give full control over the Matter Read and Subscribe requests. Most clients do not need
+them: the server subscribes to every node on its own. `subscribe`, `unsubscribe`, `enable_auto_subscription` and
+`disable_auto_subscription` are only available when the server runs with `--disable-auto-subscription`; otherwise
+they fail with `InvalidArguments`, before anything is sent to a device. `subscribe` also fails this way for a node
+whose auto subscription was switched on with `enable_auto_subscription`. `read` works in both modes.
+
+> [!WARNING]
+> These commands are meant only for the special `--disable-auto-subscription` mode, for example certification
+> testing. Do not use them in normal operation: the server's own subscription is much more reliable. It keeps the
+> node data and events up to date, so clients read current values from the node data, and it is set up again after a
+> connection loss.
+
+Paths:
+
+- Attribute paths use the [attribute path format](#attribute-path-format) of `read_attribute`, wildcards included.
+- Event paths use the same format with an event id: `endpoint/cluster/event`, for example `1/59/1`
+  (Switch `InitialPress` on endpoint 1) or `*/59/*`.
+- Data version filter paths are `endpoint/cluster` and must name both.
+- Every part must be a decimal number or `*`, and a number must be a valid id of its kind as matter.js defines it (for
+  example a standard cluster id below 0x8000, a standard event id below 0x100, a valid vendor prefix). Unlike `read_attribute`, which reads
+  any other part as a wildcard, a malformed path is rejected with `InvalidArguments`. As in `read_attribute`, 65535 as
+  endpoint and 4294967295 as cluster, attribute or event id also act as wildcards.
+- `event_min` must be an integer from 0 to 2^64-1 and `data_version` one from 0 to 2^32-1, otherwise the request is
+  rejected with `InvalidArguments`. Test nodes are not supported (`InvalidArguments`).
+- `event_min` needs at least one event path, and a non-empty `data_version_filters` needs at least one attribute path,
+  as the Matter Read Request allows EventFilters only with EventRequests and DataVersionFilters only with
+  AttributeRequests. Otherwise the request is rejected with `InvalidArguments`.
+- Every argument must have the documented type: lists must be lists, each `event_paths` and `data_version_filters`
+  entry an object, paths strings and `fabric_filtered`, `keep_subscriptions` and, in `subscribe`, `is_urgent` `true`
+  or `false`. `read` ignores `is_urgent`. An
+  argument of another type is rejected with `InvalidArguments` before anything is sent to a device. An optional
+  argument sent as `null` counts as left out.
+
+Values in the results and reports have the same shape as in `read_attribute` (attributes) and `node_event`
+(events). When the device answers a path with a status instead of data (for example an unsupported attribute),
+the path is listed in `attribute_status` or `event_status`, keyed by the path in the request format, with the
+numeric Matter status code in `status` (as in the `write_attribute` result) and the cluster-specific code in
+`cluster_status` when the device sent one. Both fields are left out when there is no status.
+`data_versions` holds the data version the device reported for each cluster with an attribute value in the result,
+keyed by `endpoint/cluster`, the form `data_version_filters` takes; it is left out when no attribute value was
+reported:
+
+```json
+{
+  "attributes": { "1/6/0": true },
+  "events": [],
+  "attribute_status": { "1/6/9999": { "status": 134 }, "1/1234/0": { "status": 195 } },
+  "event_status": { "1/69/5": { "status": 199 } },
+  "data_versions": { "1/6": 2771420034 }
+}
+```
+
+**read** *(schema 14+)* - Read attributes and events in one Matter Read request
+
+```json
+{
+  "message_id": "1",
+  "command": "read",
+  "args": {
+    "node_id": 1,
+    "attribute_paths": ["1/6/0", "0/40/*"],
+    "event_paths": [{ "path": "1/59/*" }],
+    "event_min": 120,
+    "fabric_filtered": true,
+    "data_version_filters": [{ "path": "0/40", "data_version": 3141592 }]
+  }
+}
+```
+
+At least one attribute or event path is required. `fabric_filtered` defaults to `true` (unlike `read_attribute`,
+which defaults to `false`). Matter has no default: FabricFiltered is a mandatory field of the request, and `true` is
+the default of chip-tool and the Python controller. `event_min` becomes the EventFilter of the request; without it the
+request has no event filter, also for a node with the server's own subscription, and returns every event the device
+still holds on the requested paths. The request goes to the device as given: unlike `read_attribute`, it is not
+split into batches and the server adds no data version filters of its own. For a LIT ICD with this controller
+registered, matter.js holds the request while the device sleeps and sends it at the next check-in, as it does for
+`write_attribute` and `device_command` (`subscribe` is sent at once); the request fails if the device does not check
+in in time.
+
+Side effects on all clients: matter.js merges the read attribute values into the node state, which sends the usual
+`attribute_updated` events to every listening client, but only when `fabric_filtered` is `true`, the default.
+matter.js applies a read only when its fabric filter matches the node's subscription settings, which the server
+leaves at fabric-filtered, whether or not the node currently has the server's own subscription. Without
+`--disable-auto-subscription`, the server forwards changes of a node only once its subscription has been active since
+the server started, so a read of a node that has not been subscribed yet sends no `attribute_updated`. With
+`--disable-auto-subscription` the server forwards changes of every node from the start. The events the read returns
+are only in its response: they are not sent as `node_event`, not added to the event history, and do not change the
+event number the server's own subscription resumes from.
+
+Response:
+
+```json
+{
+  "message_id": "1",
+  "result": {
+    "attributes": { "1/6/0": true, "0/40/1": "Vendor" },
+    "events": [
+      {
+        "node_id": 1, "endpoint_id": 1, "cluster_id": 59, "event_id": 1, "event_number": 121,
+        "priority": 1, "timestamp": 1704067200000, "timestamp_type": 1, "data": { "newPosition": 1 }
+      }
+    ]
+  }
+}
+```
+
+**subscribe** *(schema 14+)* - Open a Matter subscription for this connection
+
+```json
+{
+  "message_id": "1",
+  "command": "subscribe",
+  "args": {
+    "node_id": 1,
+    "attribute_paths": ["1/6/0"],
+    "event_paths": [{ "path": "1/59/*", "is_urgent": true }],
+    "min_interval": 0,
+    "max_interval": 60
+  }
+}
+```
+
+Arguments are those of `read` plus:
+
+- `min_interval`, `max_interval` (required): the MinIntervalFloor and MaxIntervalCeiling in seconds, integers from
+  0 to 65535, `max_interval` not below `min_interval`. For intermittently connected (ICD) devices matter.js sends
+  a floor of 0 instead of `min_interval`.
+- `is_urgent` per event path (optional): the IsUrgent flag of that event path.
+- `keep_subscriptions` (optional, default `false`): the KeepSubscriptions flag, sent to the device as given
+  (`false` is the default of chip-tool and the Python controller; Matter has no default). `false`, also when left
+  out, ends all other subscriptions of this controller to that node, on the device and in the server, including
+  those of other connections; each one that was opened with `subscribe` then arrives as `subscription_ended` at its
+  connection. `true` keeps them.
+
+Only the data version filters the caller gives are sent, as for `read`, so the priming report holds every requested
+cluster the caller does not filter.
+
+Response:
+
+```json
+{
+  "message_id": "1",
+  "result": {
+    "subscription_id": 2864434397,
+    "attributes": { "1/6/0": false },
+    "events": []
+  }
+}
+```
+
+`subscription_id` is the SubscriptionId the device assigned. Each device assigns its own ids, so two nodes can use the
+same one: a subscription is named by `node_id` and `subscription_id` together, in `unsubscribe` and in the events. The
+rest of the result is the priming report, in the shape of the `read` result (`attributes`, `events`,
+`attribute_status`, `event_status`, `data_versions`). Later reports follow as `subscription_report` events after this
+response. All reports have the same side effects on all clients as `read`: `attribute_updated` to every listening client, only when
+`fabric_filtered` is `true`, the default. Reported events reach only this subscription's reports, not `node_event` or
+the event history.
+
+A subscription belongs to the connection that opened it. It ends when the connection sends `unsubscribe`, when the
+connection closes, when the node is removed, and when the server shuts down. It also ends when the device stops
+reporting (no report within the max interval plus a response margin) or when another subscription of this
+controller to the node is made with `keep_subscriptions` `false` or left out, from any connection. Every end the
+connection did not ask for, including node removal, is announced with `subscription_ended`, except a server shutdown;
+`unsubscribe` and closing the connection are not announced. A server shutdown is announced only with
+`server_shutdown`: the server closes the connections before it ends their subscriptions, so no `subscription_ended`
+is sent.
+
+The server only learns that a subscription ended on the device when the local subscription times out or matter.js
+closes it. A device that dropped the subscription (for example after a reboot) is noticed at the latest after the
+max interval plus a response margin; until then the subscription still looks active.
+
+**unsubscribe** *(schema 14+)* - End a subscription of this connection
+
+```json
+{
+  "message_id": "1",
+  "command": "unsubscribe",
+  "args": { "node_id": 1, "subscription_id": 2864434397 }
+}
+```
+
+Only available with `--disable-auto-subscription`; otherwise it fails with `InvalidArguments`. Returns `null`. Both
+`node_id` and `subscription_id` are required; `subscription_id` must be an integer from 0 to 2^32-1, otherwise the
+request fails with `InvalidArguments`. A subscription this connection does not hold under that node and id
+gives an `InvalidArguments` error.
+Matter has no unsubscribe message: the server stops accepting reports, and the device ends the subscription at its
+next report.
+
+**enable_auto_subscription** / **disable_auto_subscription** - Switch the server's own subscription to one node on or off
+
+```json
+{
+  "message_id": "1",
+  "command": "enable_auto_subscription",
+  "args": { "node_id": 1 }
+}
+```
+
+Only available with `--disable-auto-subscription`; otherwise they fail with `InvalidArguments` and the node is not
+changed. Test nodes are not supported (`InvalidArguments`). With the server's own subscription on, a node behaves as
+without `--disable-auto-subscription`: device reports send `attribute_updated` and `node_event` to every listening
+client, `available` follows the connection to the device, and `register_icd` works. A LIT ICD registers on its own
+once subscribed. Polling, time synchronization, fabric label pushes and automatic OTA update checks stay off. The
+setting is not kept: every start switches all nodes off again. Switching a node to the state it already has changes
+nothing.
+
+The server's subscription asks the device only for events after the highest event number matter.js has received
+from the node through the server's own subscription or the read after commissioning.
+
+`enable_auto_subscription` returns `null` once the server's subscription to the node is active, so commands that
+need it, such as `register_icd`, work from then on. If the node's subscription is already active, it returns at
+once. It fails with an error, and the node stays switched on with matter.js trying to subscribe in the background,
+when:
+
+- matter.js finds the device unreachable while waiting: `NodeNotResolving` (4). Only a new finding counts: for a
+  node that was already marked unreachable before, for example after a failed `read`, a failed try does not change
+  that mark, so the command does not fail with `NodeNotResolving` and fails with `NodeNotReady` after the 4 minutes
+  15 seconds below unless the subscription comes up.
+- the subscription is not active within 4 minutes 15 seconds, the time matter.js allows a CASE connection while
+  commissioning: `NodeNotReady` (3)
+- the node is removed while waiting: `NodeNotExists` (5)
+- the server shuts down while waiting: `UnknownError` (0)
+
+It also fails with `NodeNotReady` (3) when `disable_auto_subscription` switches the node off while it waits; the
+node then stays switched off, also when a `resync_icd` for the node runs at the same time. A `resync_icd` while it
+waits does not make it fail, unless switching the subscription back on fails; then it fails with `NodeNotReady` (3)
+at once and the node stays switched off. Send `disable_auto_subscription` to switch a node off again after a failure.
+`disable_auto_subscription` returns `null` once the server's subscription is closed in the server. A node whose
+device cannot be reached becomes unavailable as without `--disable-auto-subscription`.
+
+The server's subscription is made with KeepSubscriptions `false`, so it ends every subscription opened with
+`subscribe` to that node once its Subscribe request goes out, which is before a successful `enable_auto_subscription`
+returns and, after a failed one, can be much later; each arrives as `subscription_ended` at its connection. While the
+node's auto subscription is on, `subscribe` for it fails with `InvalidArguments`, also when it was enabled while the
+`subscribe` was in progress. Do not send `enable_auto_subscription` while a `subscribe` for the same node with
+`keep_subscriptions` `false` (the default) is still in progress: if that `subscribe` reaches the device after the
+server's Subscribe request, the device can end the server's subscription, which the server then treats as active until
+it times out. `disable_auto_subscription` ends the server's subscription; as with `unsubscribe`, the device ends it at
+its next report.
 
 ### Commands
 
-**device_command** - Send a command to a device
+**device_command** - Send a command to a device. Identical commands (same node, endpoint, cluster, command, payload, `timed_request_timeout_ms` and `interaction_timeout_ms`) sent in parallel on the same connection are sent to the device once and share the result; commands from different connections are always sent separately.
 
 ```json
 {
@@ -547,7 +897,8 @@ Command with parameters (e.g., move to level):
 
 Optional parameters:
 - `response_type`: Client SDK type hint (currently ignored by the server)
-- `timed_request_timeout_ms`: Timeout for timed interactions (required for some commands like door lock)
+- `timed_request_timeout_ms`: Timeout for timed interactions (required for some commands like door lock), an integer from 0 to 65535; otherwise the request fails with `InvalidArguments`. 0 counts as not given: no timed request, unless the command requires one
+- `interaction_timeout_ms`: Time in milliseconds the device may take to process the command, an integer from 0 to 2^53-1; otherwise the request fails with `InvalidArguments`. Over UDP it replaces the default expected processing time of 2 seconds in the response timeout; over TCP and BLE the response timeout is the larger of 30 seconds and this value, plus 5 seconds
 
 A `node_id` in the Group Node ID range multicasts the command to the group. `endpoint_id` must then be
 absent or `null`, because a groupcast carries no endpoint: each node's own group table decides which of
@@ -559,6 +910,46 @@ invoked as a timed request, which a groupcast cannot carry.
 Whether a groupcast leaves this server also depends on a group key set existing for the group on the
 controller's fabric. This server has no command to provision one yet, so a groupcast to a group that was
 never keyed fails with error 0 and a message naming the group.
+
+**batched_device_commands** *(schema 14+)* - Send several commands to one node in a single InvokeRequest
+
+```json
+{
+  "message_id": "1",
+  "command": "batched_device_commands",
+  "args": {
+    "node_id": 1,
+    "commands": [
+      { "endpoint_id": 1, "cluster_id": 6, "command_name": "On", "payload": {} },
+      { "endpoint_id": 2, "cluster_id": 6, "command_name": "Toggle" }
+    ],
+    "timed_request_timeout_ms": 500,
+    "interaction_timeout_ms": 3000
+  }
+}
+```
+
+The commands go to the device in one InvokeRequest, in the given order, each with its own CommandRef (a batch of one
+command carries none, as the spec allows). The request is never split and never combined with other commands, and
+identical batches are not de-duplicated. Each command takes
+the fields of `device_command`; `payload` may be left out. `timed_request_timeout_ms` (0 to 65535, 0 counts as not given)
+sends one Timed Request for the whole batch; without it, the batch is timed only when one of its commands requires it.
+`interaction_timeout_ms` is the time the device may take to process the batch, as in `device_command`.
+
+Refused with `InvalidArguments` before anything is sent: an empty or missing `commands` list, a command with missing or
+wrongly typed fields, a command the node's endpoint or the server's model does not have, a payload matter.js cannot
+encode, more commands than the node accepts per invoke (its MaxPathsPerInvoke, or 1 when the node reports none; the
+message names the limit), an invalid timeout, a Group Node ID, and a WebRTC Transport Provider command, which the
+server tracks per session (send it with `device_command` or `send_webrtc_provider_command`).
+
+Response: one entry per command, in request order, with the Matter status (`0` for success), the cluster-specific
+status when the device sent one, and the command's response payload when it has one. A command the device did not
+answer has status `NO_COMMAND_RESPONSE` (0xCC). One command failing does not fail the request; a transport, session or
+timeout failure, or a response payload matter.js cannot decode, fails the whole request with the usual error.
+
+```json
+[{ "status": 0 }, { "status": 1, "cluster_status": 3 }]
+```
 
 ### Node Management
 
@@ -829,7 +1220,11 @@ This should be the last resort to try to get an ICD device in LIT mode connected
 }
 ```
 
-A LIT peer re-registers automatically once subscribed.
+A LIT peer re-registers automatically once the server's own subscription to it is active. With
+`--disable-auto-subscription` the server only drops the local registration and does not reconnect, unless
+`enable_auto_subscription` switched the server's own subscription to the node on. For a node without it, the device
+registers again once `enable_auto_subscription` makes that subscription active; `register_icd` fails until then. A
+subscription opened with `subscribe` does not count.
 
 ### Camera Streaming (schema 14+)
 
@@ -1681,6 +2076,43 @@ Format: `[node_id, "endpoint/cluster/attribute", value]`
 }
 ```
 
+### Subscription Events
+
+**subscription_report** *(schema 14+)* - A report after the priming report of a subscription opened with `subscribe`
+
+Sent only to the connection that opened the subscription, also when it has not called `start_listening`.
+
+```json
+{
+  "event": "subscription_report",
+  "data": {
+    "node_id": 1,
+    "subscription_id": 2864434397,
+    "attributes": { "1/6/0": true },
+    "events": []
+  }
+}
+```
+
+`attributes`, `events`, `attribute_status`, `event_status` and `data_versions` have the shapes of the `read` result.
+
+Like `node_event`, `subscription_report` is queued under backpressure: when a connection does not read fast enough
+and its outgoing queue passes the limit, the oldest queued events are dropped, reports included.
+`subscription_ended` is never dropped; it is sent ahead of reports still queued. A report for a subscription can
+therefore arrive after its `unsubscribe` response or after its `subscription_ended`. Ignore reports for
+subscriptions you no longer track.
+
+**subscription_ended** *(schema 14+)* - A subscription opened with `subscribe` ended without `unsubscribe`
+
+Sent only to the owning connection, for example when the node was removed or the device stopped reporting.
+
+```json
+{
+  "event": "subscription_ended",
+  "data": { "node_id": 1, "subscription_id": 2864434397 }
+}
+```
+
 ### Server Events
 
 **server_info_updated** - Server configuration changed (e.g., credentials set)
@@ -1848,6 +2280,16 @@ Attribute paths use the format: `endpoint/cluster/attribute`
 - `0/40/1` - Endpoint 0, BasicInformation cluster (40), VendorName attribute (1)
 - `*/6/*` - All endpoints, OnOff cluster, all attributes (wildcard)
 
+A number that is not a valid id of its kind as matter.js defines it (for example cluster 32768, above the standard
+cluster range that ends at 0x7fff) fails the command with `InvalidArguments`.
+
+A value of a cluster, attribute or event that the server's data model does not know (for example a manufacturer
+cluster without a custom cluster definition, or an attribute newer than the server) is sent as decoded from the TLV:
+a structure becomes an object keyed by the member's tag number (`{"1": 5, "3": {"0": "a"}}`), bytes become base64,
+lists become arrays. This also applies to the event data of `node_event`, which is otherwise keyed by field name.
+Exception: the `FeatureMap` of an unknown cluster is sent as `{}`, because matter.js cannot decode its bits without the
+cluster definition.
+
 ## Common Cluster IDs
 
 | Cluster | ID | Description |
@@ -1866,7 +2308,7 @@ Attribute paths use the format: `endpoint/cluster/attribute`
 
 ## Schema Version
 
-The current schema version is **14** (minimum supported **11**). Commands and events added in the current schema are marked **(schema 14+)** below; see [the schema changelog](websocket-api-schema-changelog.md) for what each version added. The server reports `schema_version` and `min_supported_schema_version` in the initial connection message and via `server_info`. Clients should verify that the server's `schema_version` is within their supported range.
+The current schema version is **14** (minimum supported **11**). Commands and events are marked with the schema that added them, for example **(schema 14+)**; see [the schema changelog](websocket-api-schema-changelog.md) for what each version added. The server reports `schema_version` and `min_supported_schema_version` in the initial connection message and via `server_info`. Clients should verify that the server's `schema_version` is within their supported range.
 
 ## BigInt Handling
 
@@ -1974,7 +2416,7 @@ This API is designed to be compatible with the [Python Matter Server](https://gi
 
 | Command | Status | Notes |
 |---------|--------|-------|
-| `subscribe_attribute` | Stub | Not implemented (Matter.js handles subscriptions internally) |
+| `subscribe_attribute` | Not supported | Answers `InvalidCommand`. The server subscribes to all attributes on its own (unless it runs with `--disable-auto-subscription`); use `subscribe` (schema 14) for a subscription of your own |
 
 ### Matter.js-Only Commands
 
@@ -1987,7 +2429,7 @@ These commands are available only in the Matter.js server and not in the Python 
 | `get_icd_state` | Get ICD Check-In state for a node |
 | `register_icd` | Register this controller as an ICD Check-In client |
 | `unregister_icd` | Drop this controller's ICD Check-In registration |
-| `resync_icd` | Drop the local ICD registration and reconnect |
+| `resync_icd` | Drop the local ICD registration and reconnect (with `--disable-auto-subscription`: only drop it, unless the node's auto subscription is enabled) |
 | `get_network_topology` | Return the Thread/Wi-Fi network as a graph (schema 13+) |
 | `initiate_ota_upload` | Reserve an id for the `POST /ota-upload/<upload_id>` HTTP endpoint (schema 13+) |
 | `send_webrtc_provider_command` | Send `ProvideOffer`, `SolicitOffer`, `ProvideAnswer` or `ProvideIceCandidates` to a camera endpoint yourself (schema 12+) |
@@ -1998,6 +2440,13 @@ These commands are available only in the Matter.js server and not in the Python 
 | `camera_stop_stream` | End a WebRTC session, keeping the stream allocation (schema 14+) |
 | `camera_snapshot` | Capture one still frame from a camera endpoint (schema 14+) |
 | `camera_release_stream` | Deallocate a stream nothing references (schema 14+) |
+| `read` | Read attributes and events in one Matter Read request (schema 14+) |
+| `subscribe` | Open a Matter subscription owned by the connection (schema 14+) |
+| `unsubscribe` | End a subscription opened with `subscribe` (schema 14+) |
+| `enable_auto_subscription` | Switch the server's own subscription to one node on, with `--disable-auto-subscription` (schema 14+) |
+| `disable_auto_subscription` | Switch the server's own subscription to one node off again (schema 14+) |
+| `parse_onboarding_payload` | Decode a QR code or manual pairing code without contacting a device (schema 14+) |
+| `batched_device_commands` | Send several commands to one node in a single InvokeRequest (schema 14+) |
 
 ### Data Differences
 
@@ -2010,7 +2459,7 @@ These commands are available only in the Matter.js server and not in the Python 
 ### Behavioral Differences
 
 - **Fabric Label**: `set_default_fabric_label` with null or an empty label resets to "HomeAssistant" instead of clearing. The argument itself is required: a message that states no `label` is refused with error 8 rather than resetting
-- **Attribute Subscriptions**: All attributes are subscribed automatically; the `attribute_subscriptions` field is not used
+- **Attribute Subscriptions**: All attributes are subscribed automatically (unless the server runs with `--disable-auto-subscription`); the `attribute_subscriptions` field is not used
 - **Test Nodes**: Use high bigint range to prevent collision with real Matter node IDs
 - **Malformed `args`**: An `args` that is not a JSON object is refused with error 8. The Python Matter
   Server fails while decoding the frame instead, with an error its message handler does not catch, and
@@ -2023,7 +2472,7 @@ These commands are available only in the Matter.js server and not in the Python 
 - **A missing required argument**: The Python server converts each argument against the handler's type
   hints, so a missing or mistyped one is error 8 for every command. Here each command checks its own
   arguments: the `camera_*` commands, `send_webrtc_provider_command`, `set_thread_dataset`,
-  `set_wifi_credentials` and `set_default_fabric_label` answer error 8, while a command that hands
+  `set_wifi_credentials`, `set_default_fabric_label`, `read`, `subscribe` and `unsubscribe` answer error 8, while a command that hands
   `node_id` straight to the Matter conversion — `get_node`, `interview_node`, `ping_node` and the
   other node-targeted ones — reports a missing or non-numeric one as error 0 (`UnknownError`)
 - **Node ID classes**: every node-targeted command refuses a `node_id` whose class can never name a

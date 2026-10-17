@@ -22,6 +22,7 @@ import {
     type CameraStreamIncompatibleReason,
     type CameraStreamInUseErrorDetails,
     type CameraStreamKind,
+    type CommissionFailureReason,
     ICD_MULTI_ADMIN_ERROR_CODE,
     type IcdMultiAdminErrorDetails,
 } from "./models/model.js";
@@ -182,21 +183,30 @@ function parseDetails(
     return guard(parsed) ? parsed : undefined;
 }
 
-/** Command failure reported by the server; preserves the wire error_code. */
+/** Command failure reported by the server; preserves the wire error_code and the typed failure details. */
 export class ServerCommandError extends MatterError {
     /**
      * `message` parsed as JSON, for a code in {@link ServerErrorDetailsByCode} when it matches that
      * code's type; otherwise undefined. Narrow it by code with {@link hasDetails}.
      */
     readonly details?: ServerErrorDetailsByCode[ServerErrorCodeWithDetails];
+    /** The Matter status received from the device, when matter.js reports the failure as one; see the API docs. */
+    readonly status?: number;
+    readonly clusterStatus?: number;
+    /** Why commissioning failed, for `commission_with_code` and `commission_on_network`. */
+    readonly reason?: CommissionFailureReason;
 
     constructor(
         message: string,
         readonly errorCode: number,
+        failure: { status?: number; clusterStatus?: number; reason?: CommissionFailureReason } = {},
     ) {
         super(message);
         this.name = "ServerCommandError";
         this.details = parseDetails(message, errorCode);
+        this.status = failure.status;
+        this.clusterStatus = failure.clusterStatus;
+        this.reason = failure.reason;
     }
 
     hasDetails<C extends ServerErrorCodeWithDetails>(

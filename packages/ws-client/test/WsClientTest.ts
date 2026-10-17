@@ -235,6 +235,640 @@ describe("ws-client", () => {
             });
         });
 
+        describe("subscriptions", () => {
+            const EMPTY_REPORT = { attributes: {}, events: [] };
+            const LIGHT_ON_OFF = { node_id: 1, attribute_paths: ["1/6/0"], min_interval: 0, max_interval: 60 };
+
+            beforeEach(async () => {
+                await server.stop();
+                server = new MockMatterServer({ serverInfo: { schema_version: 14 } });
+                await server.start();
+                client = new MatterClient(server.url, createNodeWebSocket);
+            });
+
+            it("refuses read, subscribe and unsubscribe on a server below schema 14 without sending them", async () => {
+                await server.stop();
+                server = new MockMatterServer({ serverInfo: { schema_version: 13 } });
+                await server.start();
+                client = new MatterClient(server.url, createNodeWebSocket);
+                await client.connect();
+
+                for (const call of [
+                    () => client.read({ node_id: 1, attribute_paths: ["1/6/0"] }),
+                    () => client.subscribe(LIGHT_ON_OFF, recorder().listener),
+                    () => client.unsubscribe(1, 7),
+                    () => client.enableAutoSubscription(1),
+                    () => client.disableAutoSubscription(1),
+                ]) {
+                    let refusal: unknown;
+                    try {
+                        await call();
+                    } catch (error) {
+                        refusal = error;
+                    }
+                    expect(refusal).to.be.instanceOf(InvalidServerVersion);
+                }
+                expect(server.getReceivedCommands().map(({ message }) => message.command)).to.deep.equal([]);
+            });
+
+            it("sends parseOnboardingPayload on schema 14 and refuses it below", async () => {
+                await server.stop();
+                server = new MockMatterServer({ serverInfo: { schema_version: 14 } });
+                server.onCommand("parse_onboarding_payload", () => ({
+                    type: "manual",
+                    short_discriminator: 15,
+                    setup_pin_code: 20202021,
+                }));
+                await server.start();
+                client = new MatterClient(server.url, createNodeWebSocket);
+                await client.connect();
+
+                const parsed = await client.parseOnboardingPayload("34970112332");
+
+                expect(parsed).to.deep.equal({ type: "manual", short_discriminator: 15, setup_pin_code: 20202021 });
+                expect(server.getReceivedCommands().map(({ message }) => message.args)).to.deep.equal([
+                    { code: "34970112332" },
+                ]);
+
+                await server.stop();
+                server = new MockMatterServer({ serverInfo: { schema_version: 13 } });
+                await server.start();
+                client = new MatterClient(server.url, createNodeWebSocket);
+                await client.connect();
+                let refusal: unknown;
+                try {
+                    await client.parseOnboardingPayload("34970112332");
+                } catch (error) {
+                    refusal = error;
+                }
+                expect(refusal).to.be.instanceOf(InvalidServerVersion);
+                expect(server.getReceivedCommands()).to.deep.equal([]);
+            });
+
+            it("sends enable and disable auto subscription for the node", async () => {
+                const received = new Array<unknown>();
+                server.onCommand("enable_auto_subscription", args => {
+                    received.push(args);
+                    return null;
+                });
+                server.onCommand("disable_auto_subscription", args => {
+                    received.push(args);
+                    return null;
+                });
+                await client.connect();
+
+                await client.enableAutoSubscription(5n);
+                await client.disableAutoSubscription(6);
+
+                expect(server.getReceivedCommands().map(({ message }) => message.command)).to.deep.equal([
+                    "enable_auto_subscription",
+                    "disable_auto_subscription",
+                ]);
+                expect(received).to.deep.equal([{ node_id: 5 }, { node_id: 6 }]);
+            });
+
+            it("sends discovery_timeout_s of commissionWithCode and refuses it below schema 14", async () => {
+                const received = new Array<unknown>();
+                server.onCommand("commission_with_code", args => {
+                    received.push(args);
+                    return { node_id: 3 };
+                });
+                await client.connect();
+                await client.commissionWithCode("MT:X", true, { discoveryTimeoutS: 600 });
+                await client.commissionWithCode("MT:X", true);
+
+                expect(received).to.deep.equal([
+                    { code: "MT:X", network_only: true, discovery_timeout_s: 600 },
+                    { code: "MT:X", network_only: true },
+                ]);
+
+                await server.stop();
+                server = new MockMatterServer({ serverInfo: { schema_version: 13 } });
+                await server.start();
+                client = new MatterClient(server.url, createNodeWebSocket);
+                await client.connect();
+                let refusal: unknown;
+                try {
+                    await client.commissionWithCode("MT:X", true, { discoveryTimeoutS: 600 });
+                } catch (error) {
+                    refusal = error;
+                }
+                expect(refusal).to.be.instanceOf(InvalidServerVersion);
+                expect(server.getReceivedCommands()).to.deep.equal([]);
+            });
+
+            it("sends timed_request_timeout_ms of writeAttribute and refuses it below schema 14", async () => {
+                const received = new Array<unknown>();
+                server.onCommand("write_attribute", args => {
+                    received.push(args);
+                    return [];
+                });
+                await client.connect();
+                await client.writeAttribute(1, "*/6/16385", 5, { timedRequestTimeoutMs: 2000 });
+                await client.writeAttribute(1, "1/6/16385", 5, 1000);
+
+                expect(received).to.deep.equal([
+                    { node_id: 1, attribute_path: "*/6/16385", value: 5, timed_request_timeout_ms: 2000 },
+                    { node_id: 1, attribute_path: "1/6/16385", value: 5 },
+                ]);
+
+                await server.stop();
+                server = new MockMatterServer({ serverInfo: { schema_version: 13 } });
+                server.onCommand("write_attribute", () => []);
+                await server.start();
+                client = new MatterClient(server.url, createNodeWebSocket);
+                await client.connect();
+                await client.writeAttribute(1, "1/6/16385", 5);
+                let refusal: unknown;
+                try {
+                    await client.writeAttribute(1, "1/6/16385", 5, { timedRequestTimeoutMs: 2000 });
+                } catch (error) {
+                    refusal = error;
+                }
+                expect(refusal).to.be.instanceOf(InvalidServerVersion);
+                expect(server.getReceivedCommands().map(({ message }) => message.command)).to.deep.equal([
+                    "write_attribute",
+                ]);
+            });
+
+            it("sends batchedDeviceCommands as one request and refuses it below schema 14", async () => {
+                const received = new Array<unknown>();
+                server.onCommand("batched_device_commands", args => {
+                    received.push(args);
+                    return [{ status: 0 }, { status: 1 }];
+                });
+                await client.connect();
+                const results = await client.batchedDeviceCommands(
+                    1,
+                    [
+                        { endpointId: 1, clusterId: 6, commandName: "On" },
+                        { endpointId: 2, clusterId: 6, commandName: "Toggle", payload: { a: 1 } },
+                    ],
+                    { timedRequestTimeoutMs: 500, interactionTimeoutMs: 3000 },
+                );
+
+                expect(results).to.deep.equal([{ status: 0 }, { status: 1 }]);
+                expect(received).to.deep.equal([
+                    {
+                        node_id: 1,
+                        commands: [
+                            { endpoint_id: 1, cluster_id: 6, command_name: "On", payload: {} },
+                            { endpoint_id: 2, cluster_id: 6, command_name: "Toggle", payload: { a: 1 } },
+                        ],
+                        timed_request_timeout_ms: 500,
+                        interaction_timeout_ms: 3000,
+                    },
+                ]);
+
+                await server.stop();
+                server = new MockMatterServer({ serverInfo: { schema_version: 13 } });
+                await server.start();
+                client = new MatterClient(server.url, createNodeWebSocket);
+                await client.connect();
+                let refusal: unknown;
+                try {
+                    await client.batchedDeviceCommands(1, [{ endpointId: 1, clusterId: 6, commandName: "On" }]);
+                } catch (error) {
+                    refusal = error;
+                }
+                expect(refusal).to.be.instanceOf(InvalidServerVersion);
+                expect(server.getReceivedCommands()).to.deep.equal([]);
+            });
+
+            it("sends the commissionOnNetwork arguments and returns a node", async () => {
+                const received = new Array<unknown>();
+                server.onCommand("commission_on_network", args => {
+                    received.push(args);
+                    return { node_id: 3 };
+                });
+                await client.connect();
+                const node = await client.commissionOnNetwork(20202021, {
+                    filterType: 2,
+                    filter: 3840,
+                    ipAddr: "192.168.1.100",
+                    discoveryTimeoutS: 600,
+                });
+                await client.commissionOnNetwork(20202021);
+
+                expect(node.node_id).equals(3);
+                expect(received).to.deep.equal([
+                    {
+                        setup_pin_code: 20202021,
+                        filter_type: 2,
+                        filter: 3840,
+                        ip_addr: "192.168.1.100",
+                        discovery_timeout_s: 600,
+                    },
+                    { setup_pin_code: 20202021 },
+                ]);
+            });
+
+            it("commissionOnNetwork applies its timeout option", async () => {
+                server.onCommand("commission_on_network", () => new Promise(resolve => setTimeout(resolve, 300)));
+                await client.connect();
+
+                let timeoutError: unknown;
+                try {
+                    await client.commissionOnNetwork(20202021, { timeout: 20 });
+                } catch (error) {
+                    timeoutError = error;
+                }
+                expect(timeoutError).to.be.instanceOf(CommandTimeoutError);
+            });
+
+            it("commissionOnNetwork works below schema 14 unless discoveryTimeoutS is set", async () => {
+                await server.stop();
+                server = new MockMatterServer({ serverInfo: { schema_version: 13 } });
+                server.onCommand("commission_on_network", () => ({ node_id: 3 }));
+                await server.start();
+                client = new MatterClient(server.url, createNodeWebSocket);
+                await client.connect();
+
+                await client.commissionOnNetwork(20202021, { filterType: 1, filter: 15 });
+                expect(server.getReceivedCommands()).to.have.length(1);
+
+                let refusal: unknown;
+                try {
+                    await client.commissionOnNetwork(20202021, { discoveryTimeoutS: 600 });
+                } catch (error) {
+                    refusal = error;
+                }
+                expect(refusal).to.be.instanceOf(InvalidServerVersion);
+                expect(server.getReceivedCommands()).to.have.length(1);
+            });
+
+            it("commissionOnNetwork refuses ipAddr below schema 6", async () => {
+                await server.stop();
+                server = new MockMatterServer({ serverInfo: { schema_version: 5 } });
+                server.onCommand("commission_on_network", () => ({ node_id: 3 }));
+                await server.start();
+                client = new MatterClient(server.url, createNodeWebSocket);
+                await client.connect();
+
+                await client.commissionOnNetwork(20202021);
+                let refusal: unknown;
+                try {
+                    await client.commissionOnNetwork(20202021, { ipAddr: "192.168.1.100" });
+                } catch (error) {
+                    refusal = error;
+                }
+                expect(refusal).to.be.instanceOf(InvalidServerVersion);
+                expect(server.getReceivedCommands()).to.have.length(1);
+            });
+
+            it("commissionOnNetwork refuses filter type 4 below schema 14, but not filter type 3", async () => {
+                await server.stop();
+                server = new MockMatterServer({ serverInfo: { schema_version: 13 } });
+                server.onCommand("commission_on_network", () => ({ node_id: 3 }));
+                await server.start();
+                client = new MatterClient(server.url, createNodeWebSocket);
+                await client.connect();
+
+                await client.commissionOnNetwork(20202021, { filterType: 3, filter: 0xfff1 });
+                let refusal: unknown;
+                try {
+                    await client.commissionOnNetwork(20202021, { filterType: 4, filter: 257 });
+                } catch (error) {
+                    refusal = error;
+                }
+                expect(refusal).to.be.instanceOf(InvalidServerVersion);
+                expect(server.getReceivedCommands()).to.have.length(1);
+            });
+
+            it("plain commissionWithCode passes the gate on a schema 13 server", async () => {
+                await server.stop();
+                server = new MockMatterServer({ serverInfo: { schema_version: 13 } });
+                server.onCommand("commission_with_code", () => ({ node_id: 3 }));
+                await server.start();
+                client = new MatterClient(server.url, createNodeWebSocket);
+                await client.connect();
+
+                const node = await client.commissionWithCode("MT:X", true);
+                expect(node.node_id).equals(3);
+            });
+
+            it("deviceCommand sends a command without options and without payload", async () => {
+                const received = new Array<unknown>();
+                server.onCommand("device_command", args => {
+                    received.push(args);
+                    return null;
+                });
+                await client.connect();
+
+                await client.deviceCommand(1, 1, 6, "Toggle");
+
+                expect(received).to.deep.equal([
+                    {
+                        node_id: 1,
+                        endpoint_id: 1,
+                        cluster_id: 6,
+                        command_name: "Toggle",
+                        payload: {},
+                        response_type: null,
+                    },
+                ]);
+            });
+
+            it("deviceCommand sends the timeouts from an options object and keeps the numeric timeout form", async () => {
+                const received = new Array<unknown>();
+                server.onCommand("device_command", args => {
+                    received.push(args);
+                    return null;
+                });
+                await client.connect();
+
+                await client.deviceCommand(
+                    1,
+                    1,
+                    6,
+                    "On",
+                    {},
+                    {
+                        timedRequestTimeoutMs: 5000,
+                        interactionTimeoutMs: 30000,
+                    },
+                );
+                await client.deviceCommand(1, 1, 6, "Off", undefined, 1000);
+
+                server.onCommand("device_command", () => new Promise(resolve => setTimeout(resolve, 300)));
+                let timeoutError: unknown;
+                try {
+                    await client.deviceCommand(1, 1, 6, "On", {}, { timeout: 20 });
+                } catch (error) {
+                    timeoutError = error;
+                }
+                expect(timeoutError).to.be.instanceOf(CommandTimeoutError);
+
+                let numericTimeoutError: unknown;
+                try {
+                    await client.deviceCommand(1, 1, 6, "On", {}, 20);
+                } catch (error) {
+                    numericTimeoutError = error;
+                }
+                expect(numericTimeoutError).to.be.instanceOf(CommandTimeoutError);
+
+                expect(received).to.deep.equal([
+                    {
+                        node_id: 1,
+                        endpoint_id: 1,
+                        cluster_id: 6,
+                        command_name: "On",
+                        payload: {},
+                        response_type: null,
+                        timed_request_timeout_ms: 5000,
+                        interaction_timeout_ms: 30000,
+                    },
+                    {
+                        node_id: 1,
+                        endpoint_id: 1,
+                        cluster_id: 6,
+                        command_name: "Off",
+                        payload: {},
+                        response_type: null,
+                    },
+                ]);
+            });
+
+            function recorder() {
+                const reports = new Array<number>();
+                let ended = 0;
+                return {
+                    listener: {
+                        report: ({ subscription_id }: { subscription_id: number }) => reports.push(subscription_id),
+                        ended: () => ended++,
+                    },
+                    reports,
+                    ended: () => ended,
+                };
+            }
+
+            async function eventsArrived() {
+                server.onCommand("get_nodes", () => []);
+                await client.getNodes();
+            }
+
+            it("passes the reports and the end of a subscription to its listener only", async () => {
+                server.onCommand("subscribe", () => {
+                    queueMicrotask(() =>
+                        server.sendEvent("subscription_report", { node_id: 1, subscription_id: 7, ...EMPTY_REPORT }),
+                    );
+                    return { subscription_id: 7, ...EMPTY_REPORT };
+                });
+                await client.connect();
+                const own = recorder();
+
+                const result = await client.subscribe(LIGHT_ON_OFF, own.listener);
+                server.sendEvent("subscription_report", { node_id: 1, subscription_id: 8, ...EMPTY_REPORT });
+                server.sendEvent("subscription_ended", { node_id: 1, subscription_id: 7 });
+                server.sendEvent("subscription_report", { node_id: 1, subscription_id: 7, ...EMPTY_REPORT });
+                await eventsArrived();
+
+                expect(result.subscription_id).equals(7);
+                expect([own.reports, own.ended()]).deep.equals([[7], 1]);
+            });
+
+            it("tells apart subscriptions of two nodes that got the same id", async () => {
+                server.onCommand("subscribe", () => ({ subscription_id: 7, ...EMPTY_REPORT }));
+                await client.connect();
+                const first = recorder();
+                const second = recorder();
+
+                await client.subscribe(LIGHT_ON_OFF, first.listener);
+                await client.subscribe({ ...LIGHT_ON_OFF, node_id: 2n }, second.listener);
+                server.sendEvent("subscription_report", { node_id: 2, subscription_id: 7, ...EMPTY_REPORT });
+                server.sendEvent("subscription_ended", { node_id: 1, subscription_id: 7 });
+                await eventsArrived();
+                await client.unsubscribe(2n, 7);
+
+                expect([first.reports, first.ended()]).deep.equals([[], 1]);
+                expect([second.reports, second.ended()]).deep.equals([[7], 0]);
+                expect(server.getReceivedCommands().at(-1)?.message.args).deep.equals({
+                    node_id: 2,
+                    subscription_id: 7,
+                });
+            });
+
+            it("stops calling the listener after unsubscribe", async () => {
+                server.onCommand("subscribe", () => ({ subscription_id: 7, ...EMPTY_REPORT }));
+                await client.connect();
+                const own = recorder();
+
+                await client.subscribe(LIGHT_ON_OFF, own.listener);
+                await client.unsubscribe(1, 7);
+                server.sendEvent("subscription_report", { node_id: 1, subscription_id: 7, ...EMPTY_REPORT });
+                server.sendEvent("subscription_ended", { node_id: 1, subscription_id: 7 });
+                await eventsArrived();
+
+                expect([own.reports, own.ended()]).deep.equals([[], 0]);
+                expect(server.getReceivedCommands().map(({ message }) => message.command)).includes("unsubscribe");
+            });
+
+            it("reads with the request as given", async () => {
+                server.onCommand("read", () => EMPTY_REPORT);
+                await client.connect();
+
+                const result = await client.read({ node_id: 1, attribute_paths: ["1/6/0"], fabric_filtered: true });
+
+                expect(result).deep.equals(EMPTY_REPORT);
+                expect(server.getReceivedCommands().at(-1)?.message.args).deep.equals({
+                    node_id: 1,
+                    attribute_paths: ["1/6/0"],
+                    fabric_filtered: true,
+                });
+            });
+
+            it("registers no listener when the subscribe fails", async () => {
+                server.onCommand("subscribe", () => {
+                    throw new MockCommandError("rejected", 8);
+                });
+                await client.connect();
+                const own = recorder();
+
+                const error = await client.subscribe(LIGHT_ON_OFF, own.listener).catch((error: unknown) => error);
+                server.sendEvent("subscription_report", { node_id: 1, subscription_id: 7, ...EMPTY_REPORT });
+                await eventsArrived();
+
+                expect(error).instanceOf(ServerCommandError);
+                expect(own.reports).deep.equals([]);
+            });
+
+            it("ends a subscription whose response arrives after the timeout", async () => {
+                server.onCommand(
+                    "subscribe",
+                    () =>
+                        new Promise(resolve => setTimeout(() => resolve({ subscription_id: 7, ...EMPTY_REPORT }), 50)),
+                );
+                await client.connect();
+                const own = recorder();
+
+                const error = await client.subscribe(LIGHT_ON_OFF, own.listener, 10).catch((error: unknown) => error);
+                const unsubscribed = () =>
+                    server.getReceivedCommands().some(({ message }) => message.command === "unsubscribe");
+                for (let waited = 0; !unsubscribed() && waited < 2000; waited += 10) {
+                    await new Promise(resolve => setTimeout(resolve, 10));
+                }
+                server.sendEvent("subscription_report", { node_id: 1, subscription_id: 7, ...EMPTY_REPORT });
+                await eventsArrived();
+
+                expect(error).instanceOf(CommandTimeoutError);
+                expect(own.reports).deep.equals([]);
+                expect(server.getReceivedCommands().map(({ message }) => message.args)).deep.includes({
+                    node_id: 1,
+                    subscription_id: 7,
+                });
+            });
+
+            it("ends every subscription when the connection is lost", async () => {
+                server.onCommand("subscribe", () => ({ subscription_id: 7, ...EMPTY_REPORT }));
+                await client.connect();
+                const own = recorder();
+                const lost = new Promise<void>(resolve => client.addEventListener("connection_lost", resolve));
+
+                await client.subscribe(LIGHT_ON_OFF, own.listener);
+                await server.stop();
+                await lost;
+
+                expect(own.ended()).equals(1);
+            });
+
+            it("gives a listener no report from before a lost connection after reconnecting", async () => {
+                server.onCommand("subscribe", () => ({ subscription_id: 7, ...EMPTY_REPORT }));
+                await client.connect();
+                const own = recorder();
+                const lost = new Promise<void>(resolve => client.addEventListener("connection_lost", resolve));
+                await client.subscribe(LIGHT_ON_OFF, own.listener);
+                const port = server.actualPort;
+
+                await server.stop();
+                await lost;
+                server = new MockMatterServer({ port, serverInfo: { schema_version: 14 } });
+                await server.start();
+                await client.connect();
+                server.sendEvent("subscription_report", { node_id: 1, subscription_id: 7, ...EMPTY_REPORT });
+                await eventsArrived();
+
+                expect([own.reports, own.ended()]).deep.equals([[], 1]);
+            });
+
+            it("clears its timeout once the subscription is answered", async () => {
+                server.onCommand("subscribe", () => ({ subscription_id: 7, ...EMPTY_REPORT }));
+                await client.connect();
+                const timeout = 54_321;
+                const started = new Array<unknown>();
+                const cleared = new Array<unknown>();
+                const { setTimeout: realSetTimeout, clearTimeout: realClearTimeout } = globalThis;
+                const replace = (name: "setTimeout" | "clearTimeout", value: unknown) =>
+                    Object.defineProperty(globalThis, name, { value, configurable: true, writable: true });
+                replace("setTimeout", (handler: () => void, delay?: number) => {
+                    const timer = realSetTimeout(handler, delay);
+                    if (delay === timeout) {
+                        started.push(timer);
+                    }
+                    return timer;
+                });
+                replace("clearTimeout", (timer?: ReturnType<typeof realSetTimeout>) => {
+                    cleared.push(timer);
+                    realClearTimeout(timer);
+                });
+                try {
+                    await client.subscribe(LIGHT_ON_OFF, recorder().listener, timeout);
+                } finally {
+                    replace("setTimeout", realSetTimeout);
+                    replace("clearTimeout", realClearTimeout);
+                }
+
+                expect(started.length).equals(1);
+                expect(cleared).includes(started[0]);
+            });
+
+            for (const timeout of [0, -1]) {
+                it(`waits for the answer without a timeout when the timeout is ${timeout}`, async () => {
+                    server.onCommand(
+                        "subscribe",
+                        () =>
+                            new Promise(resolve =>
+                                setTimeout(() => resolve({ subscription_id: 7, ...EMPTY_REPORT }), 30),
+                            ),
+                    );
+                    await client.connect();
+
+                    const result = await client.subscribe(LIGHT_ON_OFF, recorder().listener, timeout);
+
+                    expect(result.subscription_id).equals(7);
+                });
+            }
+
+            it("ends the other subscriptions and disconnects when a listener fails on end", async () => {
+                let id = 7;
+                server.onCommand("subscribe", () => ({ subscription_id: id++, ...EMPTY_REPORT }));
+                await client.connect();
+                const other = recorder();
+
+                await client.subscribe(LIGHT_ON_OFF, {
+                    report: () => {},
+                    ended: () => {
+                        throw new Error("listener failed");
+                    },
+                });
+                await client.subscribe(LIGHT_ON_OFF, other.listener);
+                client.disconnect();
+
+                expect(other.ended()).equals(1);
+                expect(client.connection.connected).equals(false);
+            });
+
+            it("ends every subscription when the client disconnects", async () => {
+                server.onCommand("subscribe", () => ({ subscription_id: 7, ...EMPTY_REPORT }));
+                await client.connect();
+                const own = recorder();
+
+                await client.subscribe(LIGHT_ON_OFF, own.listener);
+                client.disconnect();
+
+                expect(own.ended()).equals(1);
+            });
+        });
+
         describe("commands", () => {
             it("should send command and receive response", async () => {
                 server.onCommand("get_nodes", () => []);
@@ -343,6 +977,27 @@ describe("ws-client", () => {
                 expect(received?.allow_multi_admin).to.equal(true);
                 expect(received?.ignored_vendors).to.deep.equal([4631]);
                 expect(state.registered).to.equal(true);
+            });
+
+            it("preserves the device status and commissioning reason on command errors", async () => {
+                server.onCommand("register_icd", () => {
+                    throw new MockCommandError("failed", 0, { status: 1, cluster_status: 3, reason: "timeout" });
+                });
+                await client.connect();
+                try {
+                    await client.registerIcd(BigInt(5));
+                    expect.fail("Should have thrown");
+                } catch (error) {
+                    if (!(error instanceof ServerCommandError)) {
+                        throw error;
+                    }
+                    const { status, clusterStatus, reason } = error;
+                    expect({ status, clusterStatus, reason }).to.deep.equal({
+                        status: 1,
+                        clusterStatus: 3,
+                        reason: "timeout",
+                    });
+                }
             });
 
             it("preserves error_code on command errors", async () => {

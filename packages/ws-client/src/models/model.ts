@@ -405,6 +405,40 @@ export type WebRtcCallbackData =
     | (WebRtcCallbackBase & { event_type: "ice_candidates"; data: WebRtcIceCandidatesData | null })
     | (WebRtcCallbackBase & { event_type: "end"; data: WebRtcEndData | null });
 
+/** Request fields shared by the `read` and `subscribe` commands. */
+export interface InteractionReadArgs {
+    node_id: number | bigint;
+    /** "endpoint/cluster/attribute", wildcards as in `read_attribute`. */
+    attribute_paths?: string[];
+    /** `path` is "endpoint/cluster/event", wildcards as in `read_attribute`. */
+    event_paths?: Array<{ path: string }>;
+    /** Without it, a `read` has no event filter and returns every event the device holds. */
+    event_min?: number | bigint;
+    /** Defaults to true. */
+    fabric_filtered?: boolean;
+    /** `path` is "endpoint/cluster", both concrete. */
+    data_version_filters?: Array<{ path: string; data_version: number }>;
+}
+
+/** A Matter status for one path: `status` is the Matter status code, `cluster_status` the cluster-specific one. */
+export interface PathStatus {
+    status: number;
+    cluster_status?: number;
+}
+
+/**
+ * Attribute values as in `read_attribute`, events as in `node_event`. The status maps are keyed by the path in the
+ * request format and are present only when the device returned a status for a path.
+ */
+export interface InteractionReportData {
+    attributes: AttributesData;
+    events: Array<MatterNodeEvent>;
+    attribute_status?: { [path: string]: PathStatus };
+    event_status?: { [path: string]: PathStatus };
+    /** Schema 14. The data version of each cluster with a reported attribute value, keyed by `endpoint/cluster`. */
+    data_versions?: { [path: string]: number };
+}
+
 export interface CameraResolution {
     width: number;
     height: number;
@@ -924,7 +958,17 @@ export interface APICommands {
         response: MatterNodeData;
     };
     commission_with_code: {
-        requestArgs: { code: string; network_only?: boolean; wifi_credentials_id?: string; thread_dataset_id?: string };
+        requestArgs: {
+            code: string;
+            network_only?: boolean;
+            wifi_credentials_id?: string;
+            thread_dataset_id?: string;
+            /**
+             * Schema 14. Seconds to find the device and establish PASE with it, at most 172800 (48 hours, the longest a device
+             * announces for commissioning); matter.js searches 3 minutes without it.
+             */
+            discovery_timeout_s?: number;
+        };
         response: MatterNodeData;
     };
     commission_on_network: {
@@ -932,12 +976,19 @@ export interface APICommands {
             setup_pin_code: number;
             /** Discovery filter type: 0=None, 1=ShortDiscriminator, 2=LongDiscriminator, 3=VendorId, 4=DeviceType */
             filter_type?: number;
-            /** Filter value (discriminator, vendor ID, or device type depending on filter_type) */
+            /** Filter value (discriminator, vendor ID or device type depending on filter_type) */
             filter?: number;
             /** Direct IP address for commissioning */
             ip_addr?: string;
+            /** Schema 14. Same as `discovery_timeout_s` of `commission_with_code`. */
+            discovery_timeout_s?: number;
         };
         response: MatterNodeData;
+    };
+    /** Schema 14. Decodes a QR code payload or a manual pairing code without contacting any device. */
+    parse_onboarding_payload: {
+        requestArgs: { code: string };
+        response: OnboardingPayloadResult;
     };
     set_wifi_credentials: {
         requestArgs: { ssid: string; credentials: string; id?: string };
@@ -1173,9 +1224,53 @@ export interface APICommands {
         requestArgs: { filter_vendors?: Array<number> };
         response: { [key: string]: string };
     };
-    subscribe_attribute: {
-        requestArgs: Record<string, never>;
-        response: Record<string, never>;
+    /**
+     * Schema 14. Paths use the `read_attribute` format; event paths are "endpoint/cluster/event". Only available with
+     * the server running with auto subscription disabled.
+     */
+    subscribe: {
+        requestArgs: Omit<InteractionReadArgs, "event_paths"> & {
+            event_paths?: Array<{ path: string; is_urgent?: boolean }>;
+            /** Seconds. */
+            min_interval: number;
+            /** Seconds. */
+            max_interval: number;
+            /** Defaults to false. */
+            keep_subscriptions?: boolean;
+        };
+        /** Carries the priming report; `subscription_report` carries only the later ones. */
+        response: InteractionReportData & { subscription_id: number };
+    };
+    /**
+     * Schema 14. Only the connection that opened the subscription can end it. Only available with the server running
+     * with auto subscription disabled.
+     */
+    unsubscribe: {
+        /** A subscription id is only unique per node, so the node is part of it. */
+        requestArgs: { node_id: number | bigint; subscription_id: number };
+        response: null;
+    };
+    /**
+     * Schema 14. Switches the server's own subscription to the node on, until the server restarts. Only available with
+     * the server running with auto subscription disabled. Ends the node's subscriptions opened with `subscribe`. Resolves
+     * once the subscription is active; fails when matter.js finds the device unreachable meanwhile, when the
+     * subscription is not active within 4 minutes 15 seconds, or when the node is removed or the server shuts down
+     * meanwhile, and the node then stays switched on. Also fails when `disable_auto_subscription` switches the node off
+     * meanwhile.
+     */
+    enable_auto_subscription: {
+        requestArgs: { node_id: number | bigint };
+        response: null;
+    };
+    /** Schema 14. Only available with the server running with auto subscription disabled. */
+    disable_auto_subscription: {
+        requestArgs: { node_id: number | bigint };
+        response: null;
+    };
+    /** Schema 14. */
+    read: {
+        requestArgs: InteractionReadArgs;
+        response: InteractionReportData;
     };
     read_attribute: {
         requestArgs: {
@@ -1187,17 +1282,43 @@ export interface APICommands {
         };
         response: AttributesData;
     };
+    /**
+     * Schema 14. Sends all commands to the node in one InvokeRequest, in the given order, never split and never combined
+     * with other commands. Not for groups.
+     */
+    batched_device_commands: {
+        requestArgs: {
+            node_id: number | bigint;
+            /** At most as many commands as the node accepts per invoke (its MaxPathsPerInvoke). */
+            commands: Array<{ endpoint_id: number; cluster_id: number; command_name: string; payload?: unknown }>;
+            /** Sends the batch after one Timed Request with this timeout (0 to 65535). */
+            timed_request_timeout_ms?: number | null;
+            /** Time the device may take to process the batch. */
+            interaction_timeout_ms?: number | null;
+        };
+        /** One entry per command, in request order; a command's failure does not fail the request. */
+        response: BatchedCommandResult[];
+    };
     write_attribute: {
         requestArgs: {
             node_id: number | bigint;
-            /** `endpoint/cluster/attribute`. Use `*` as the endpoint when `node_id` is a Group Node ID. */
+            /**
+             * `endpoint/cluster/attribute`. `*` as the endpoint writes every endpoint of the node that has the attribute
+             * (schema 14), and is required when `node_id` is a Group Node ID.
+             */
             attribute_path: string;
             value: unknown;
+            /** Schema 14. Sends the write as a timed write with this timeout (0 to 65535); unicast only. */
+            timed_request_timeout_ms?: number | null;
         };
-        /** The node's write status, one entry for the path written; `null` for a groupcast (no node answers). */
+        /**
+         * The node's write status per path it answered for: one entry for a specific endpoint, one per endpoint reached
+         * for a wildcard endpoint. `null` for a groupcast (no node answers).
+         */
         response: Array<{
             Path: { EndpointId: number; ClusterId: number; AttributeId: number };
             Status: number;
+            ClusterStatus?: number;
         }> | null;
     };
     ping_node: {
@@ -1398,6 +1519,12 @@ export interface APIEvents {
     webrtc_callback: {
         data: WebRtcCallbackData;
     };
+    subscription_report: {
+        data: SubscriptionReportData;
+    };
+    subscription_ended: {
+        data: SubscriptionEndedData;
+    };
     /**
      * Another connection ended a session with `camera_stop_stream` or a `device_command` `EndSession`.
      *
@@ -1471,6 +1598,26 @@ interface ServerEventWebRtcCallback {
     event: "webrtc_callback";
     data: WebRtcCallbackData;
 }
+/** Schema 14: sent only to the connection that opened the subscription. */
+export interface SubscriptionReportData extends InteractionReportData {
+    node_id: number | bigint;
+    subscription_id: number;
+}
+
+/** Schema 14. */
+export interface SubscriptionEndedData {
+    node_id: number | bigint;
+    subscription_id: number;
+}
+interface ServerEventSubscriptionReport {
+    event: "subscription_report";
+    data: SubscriptionReportData;
+}
+/** Schema 14: a subscription ended without `unsubscribe`; sent only to the connection that opened it. */
+interface ServerEventSubscriptionEnded {
+    event: "subscription_ended";
+    data: SubscriptionEndedData;
+}
 interface ServerEventCameraSessionEnded {
     event: "camera_session_ended";
     data: CameraSessionEndedData;
@@ -1493,6 +1640,8 @@ export type EventMessage =
     | ServerEventThreadDiagnosticsUpdated
     | ServerEventNetworkTopologyUpdated
     | ServerEventWebRtcCallback
+    | ServerEventSubscriptionReport
+    | ServerEventSubscriptionEnded
     | ServerEventCameraSessionEnded
     | ServerEventCameraStreamEvicted;
 
@@ -1500,9 +1649,59 @@ export interface ResultMessageBase {
     message_id: string;
 }
 
+/** The device's answer to one command of `batched_device_commands`. */
+export interface BatchedCommandResult {
+    /** Matter status; 0 for success. */
+    status: number;
+    cluster_status?: number;
+    /** The command's response payload, when it has one. */
+    response?: unknown;
+}
+
+/** One payload of a QR code, as `parse_onboarding_payload` decodes it. */
+export interface QrOnboardingPayload {
+    version: number;
+    /** Left out when the payload says 0 (unspecified). */
+    vendor_id?: number;
+    /** Left out when the payload says 0 (unspecified). */
+    product_id?: number;
+    /** 0 standard, 1 user-intent, 2 custom. */
+    flow_type: number;
+    /** The discovery capabilities bitmask as encoded in the payload. */
+    discovery_capabilities: number;
+    discriminator: number;
+    setup_pin_code: number;
+}
+
+/** Result of `parse_onboarding_payload`. */
+export type OnboardingPayloadResult =
+    | { type: "qr"; payloads: QrOnboardingPayload[] }
+    | {
+          type: "manual";
+          short_discriminator: number;
+          setup_pin_code: number;
+          /** Only in the 21-digit form, and left out where it says 0. */
+          vendor_id?: number;
+          /** Only in the 21-digit form, and left out where it says 0. */
+          product_id?: number;
+      };
+
+/** Why commissioning failed; sent with `commission_with_code` and `commission_on_network` errors. */
+export type CommissionFailureReason =
+    | "not-discovered"
+    | "passcode-mismatch"
+    | "invalid-payload"
+    | "attestation-rejected"
+    | "timeout"
+    | "other";
+
 export interface ErrorResultMessage extends ResultMessageBase {
     error_code: number;
     details?: string;
+    /** The Matter status received from the device, when matter.js reports the failure as one; see the API docs. */
+    status?: number;
+    cluster_status?: number;
+    reason?: CommissionFailureReason;
 }
 
 export interface SuccessResultMessage extends ResultMessageBase {

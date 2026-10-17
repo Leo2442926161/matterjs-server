@@ -24,6 +24,7 @@ import {
     MatterSoftwareVersion,
     NodePingResult,
     ResponseOf,
+    SubscriptionReportData,
     SuccessResultMessage,
     ThreadDiagnosticsBatch,
     CameraSessionEndedData,
@@ -70,6 +71,64 @@ export interface CommissionWithCodeOptions {
     wifiCredentialsId?: string;
     /** Stored Thread dataset id to use (schema 12; omit for the reserved `default` entry). */
     threadDatasetId?: string;
+    /**
+     * Schema 14. Seconds the server looks for the device and sets up PASE; see the API docs for the limit. The call
+     * still ends after `timeout`, so a long value needs a larger `timeout` too.
+     */
+    discoveryTimeoutS?: number;
+    /** Per-call command timeout in ms (overrides {@link MatterClient.commandTimeout}). */
+    timeout?: number;
+}
+
+/** Options for {@link MatterClient.commissionOnNetwork}. */
+export interface CommissionOnNetworkOptions {
+    /** Discovery filter type: 0=None, 1=ShortDiscriminator, 2=LongDiscriminator, 3=VendorId, 4=DeviceType. */
+    filterType?: number;
+    /** Filter value (discriminator, vendor ID or device type depending on `filterType`). */
+    filter?: number;
+    /** Direct IP address of the device (schema 6). */
+    ipAddr?: string;
+    /**
+     * Schema 14. Seconds the server looks for the device and sets up PASE; see the API docs for the limit. The call
+     * still ends after `timeout`, so a long value needs a larger `timeout` too.
+     */
+    discoveryTimeoutS?: number;
+    /** Per-call command timeout in ms (overrides {@link MatterClient.commandTimeout}). */
+    timeout?: number;
+}
+
+/** Options for {@link MatterClient.deviceCommand}. */
+export interface DeviceCommandOptions {
+    /** Timeout for timed interactions, as required by some commands (door lock). */
+    timedRequestTimeoutMs?: number;
+    /** Time the device may take to process the command. */
+    interactionTimeoutMs?: number;
+    /** Per-call command timeout in ms (overrides {@link MatterClient.commandTimeout}). */
+    timeout?: number;
+}
+
+/** One command of {@link MatterClient.batchedDeviceCommands}. */
+export interface BatchedDeviceCommand {
+    endpointId: number;
+    clusterId: number;
+    commandName: string;
+    payload?: Record<string, unknown>;
+}
+
+/** Options for {@link MatterClient.batchedDeviceCommands}. */
+export interface BatchedDeviceCommandsOptions {
+    /** Sends the batch after one Timed Request with this timeout (0 to 65535 ms). */
+    timedRequestTimeoutMs?: number;
+    /** Time the device may take to process the batch. */
+    interactionTimeoutMs?: number;
+    /** Per-call command timeout in ms (overrides {@link MatterClient.commandTimeout}). */
+    timeout?: number;
+}
+
+/** Options for {@link MatterClient.writeAttribute}. */
+export interface WriteAttributeOptions {
+    /** Schema 14. Sends the write as a timed write with this timeout (0 to 65535 ms). */
+    timedRequestTimeoutMs?: number;
     /** Per-call command timeout in ms (overrides {@link MatterClient.commandTimeout}). */
     timeout?: number;
 }
@@ -80,6 +139,11 @@ export interface CredentialCommandOptions {
     id?: string;
     /** Per-call command timeout in ms (overrides {@link MatterClient.commandTimeout}). */
     timeout?: number;
+}
+
+/** Subscription ids are assigned by each device, so only node and id together name one subscription. */
+function subscriptionKey(nodeId: number | bigint, subscriptionId: number) {
+    return `${nodeId}/${subscriptionId}`;
 }
 
 /**
@@ -106,6 +170,14 @@ export interface ClientEventMap {
 
 type ClientEventListeners = { [E in keyof ClientEventMap]: Array<(...args: ClientEventMap[E]) => void> };
 
+/** Receives the events of one subscription opened with {@link MatterClient.subscribe}. */
+export interface SubscriptionListener {
+    /** A report after the first one, which the `subscribe` result carries. */
+    report(data: SubscriptionReportData): void;
+    /** The subscription ended without `unsubscribe`, the connection to the server was lost, or {@link MatterClient.disconnect} was called. */
+    ended?(): void;
+}
+
 export class MatterClient {
     public connection: Connection;
     public nodes: Record<string, MatterNode> = {};
@@ -129,6 +201,8 @@ export class MatterClient {
             timeoutId?: ReturnType<typeof setTimeout>;
         }
     > = {};
+    /** Keyed by {@link subscriptionKey}. */
+    private subscriptionListeners = new Map<string, SubscriptionListener>();
     // Start with random offset for defense-in-depth and easier debugging across sessions
     private msgId = Math.floor(Math.random() * 0x7fffffff);
     private eventListeners: ClientEventListeners = {
@@ -246,14 +320,37 @@ export class MatterClient {
         const usesIds = opts.wifiCredentialsId !== undefined || opts.threadDatasetId !== undefined;
         const data = await this.sendCommand(
             "commission_with_code",
-            usesIds ? 12 : 0,
+            opts.discoveryTimeoutS !== undefined ? 14 : usesIds ? 12 : 0,
             {
                 code,
                 network_only: networkOnly,
                 wifi_credentials_id: opts.wifiCredentialsId,
                 thread_dataset_id: opts.threadDatasetId,
+                discovery_timeout_s: opts.discoveryTimeoutS,
             },
             opts.timeout,
+        );
+        return new MatterNode(data);
+    }
+
+    /** Commissions a device that is already on the network, found by setup PIN code and optional filter or IP. */
+    async commissionOnNetwork(setupPinCode: number, options: CommissionOnNetworkOptions = {}): Promise<MatterNode> {
+        const data = await this.sendCommand(
+            "commission_on_network",
+            // An older server ignores filter type 4 and commissions any device with the setup code.
+            options.discoveryTimeoutS !== undefined || options.filterType === 4
+                ? 14
+                : options.ipAddr !== undefined
+                  ? 6
+                  : 0,
+            {
+                setup_pin_code: setupPinCode,
+                filter_type: options.filterType,
+                filter: options.filter,
+                ip_addr: options.ipAddr,
+                discovery_timeout_s: options.discoveryTimeoutS,
+            },
+            options.timeout,
         );
         return new MatterNode(data);
     }
@@ -445,22 +542,93 @@ export class MatterClient {
         );
     }
 
+    /** Schema 14. A Matter Read with full control over the request. */
+    async read(args: APICommands["read"]["requestArgs"], timeout?: number): Promise<ResponseOf<"read">> {
+        return await this.sendCommand("read", 14, args, timeout);
+    }
+
+    /**
+     * Schema 14. Opens a Matter subscription owned by this connection. The result carries the first report; later
+     * reports and the end go to `listener` until {@link unsubscribe}.
+     */
+    async subscribe(
+        args: APICommands["subscribe"]["requestArgs"],
+        listener: SubscriptionListener,
+        timeout = this.commandTimeout,
+    ): Promise<ResponseOf<"subscribe">> {
+        let timedOut = false;
+        // Registered when the response is handled, because a report can arrive in the same socket read.
+        const response = this.sendCommand("subscribe", 14, args, 0, ({ subscription_id }) => {
+            if (timedOut) {
+                // The caller never learned this id, so nobody else can end the subscription.
+                this.unsubscribe(args.node_id, subscription_id).catch(error =>
+                    console.warn(`Could not end subscription ${subscription_id} after its subscribe timed out`, error),
+                );
+                return;
+            }
+            this.subscriptionListeners.set(subscriptionKey(args.node_id, subscription_id), listener);
+        });
+        if (timeout <= 0) {
+            return await response;
+        }
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+            return await Promise.race([
+                response,
+                new Promise<never>((_resolve, reject) => {
+                    timer = setTimeout(() => {
+                        timedOut = true;
+                        reject(new CommandTimeoutError("subscribe", timeout));
+                    }, timeout);
+                }),
+            ]);
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    /** Schema 14. Ends a subscription opened with {@link subscribe}; its listener gets no further calls. */
+    async unsubscribe(nodeId: number | bigint, subscriptionId: number, timeout?: number): Promise<void> {
+        this.subscriptionListeners.delete(subscriptionKey(nodeId, subscriptionId));
+        await this.sendCommand("unsubscribe", 14, { node_id: nodeId, subscription_id: subscriptionId }, timeout);
+    }
+
+    /**
+     * Schema 14. Switches the server's own subscription to the node on; see the API docs for when this fails. Only
+     * available with the server running with auto subscription disabled.
+     */
+    async enableAutoSubscription(nodeId: number | bigint, timeout?: number): Promise<void> {
+        await this.sendCommand("enable_auto_subscription", 14, { node_id: nodeId }, timeout);
+    }
+
+    /** Schema 14. Decodes a QR code payload (`MT:…`) or a manual pairing code without contacting any device. */
+    async parseOnboardingPayload(code: string, timeout?: number): Promise<ResponseOf<"parse_onboarding_payload">> {
+        return await this.sendCommand("parse_onboarding_payload", 14, { code }, timeout);
+    }
+
+    /** Schema 14. Switches the server's own subscription to the node off. Only available with auto subscription disabled. */
+    async disableAutoSubscription(nodeId: number | bigint, timeout?: number): Promise<void> {
+        await this.sendCommand("disable_auto_subscription", 14, { node_id: nodeId }, timeout);
+    }
+
+    /** Writes an attribute; `*` as the endpoint writes every endpoint of the node that has it (schema 14). */
     async writeAttribute(
         nodeId: number | bigint,
         attributePath: string,
         value: unknown,
-        timeout?: number,
+        optsOrTimeout?: number | WriteAttributeOptions,
     ): Promise<ResponseOf<"write_attribute">> {
-        // Write an attribute(value) on a target node.
+        const opts = typeof optsOrTimeout === "number" ? { timeout: optsOrTimeout } : (optsOrTimeout ?? {});
         return await this.sendCommand(
             "write_attribute",
-            0,
+            opts.timedRequestTimeoutMs !== undefined ? 14 : 0,
             {
                 node_id: nodeId,
                 attribute_path: attributePath,
                 value: value,
+                timed_request_timeout_ms: opts.timedRequestTimeoutMs,
             },
-            timeout,
+            opts.timeout,
         );
     }
 
@@ -545,9 +713,10 @@ export class MatterClient {
         endpointId: number,
         clusterId: number,
         commandName: string,
-        payload: Record<string, unknown> = {},
-        timeout?: number,
+        payload?: Record<string, unknown>,
+        optsOrTimeout?: number | DeviceCommandOptions,
     ): Promise<unknown> {
+        const opts = typeof optsOrTimeout === "number" ? { timeout: optsOrTimeout } : (optsOrTimeout ?? {});
         return await this.sendCommand(
             "device_command",
             0,
@@ -556,10 +725,39 @@ export class MatterClient {
                 endpoint_id: endpointId,
                 cluster_id: clusterId,
                 command_name: commandName,
-                payload,
+                payload: payload ?? {},
                 response_type: null,
+                timed_request_timeout_ms: opts.timedRequestTimeoutMs,
+                interaction_timeout_ms: opts.interactionTimeoutMs,
             },
-            timeout,
+            opts.timeout,
+        );
+    }
+
+    /**
+     * Schema 14. Sends all commands to the node in one InvokeRequest, in order, never split and never combined with
+     * other commands. Answers one entry per command; one command failing does not fail the others.
+     */
+    async batchedDeviceCommands(
+        nodeId: number | bigint,
+        commands: BatchedDeviceCommand[],
+        opts: BatchedDeviceCommandsOptions = {},
+    ): Promise<ResponseOf<"batched_device_commands">> {
+        return await this.sendCommand(
+            "batched_device_commands",
+            14,
+            {
+                node_id: nodeId,
+                commands: commands.map(({ endpointId, clusterId, commandName, payload }) => ({
+                    endpoint_id: endpointId,
+                    cluster_id: clusterId,
+                    command_name: commandName,
+                    payload: payload ?? {},
+                })),
+                timed_request_timeout_ms: opts.timedRequestTimeoutMs,
+                interaction_timeout_ms: opts.interactionTimeoutMs,
+            },
+            opts.timeout,
         );
     }
 
@@ -644,6 +842,7 @@ export class MatterClient {
      * @param require_schema Minimum schema version required (0 for any version)
      * @param args Command arguments
      * @param timeout Optional timeout in milliseconds. Defaults to `commandTimeout`. Set to 0 to disable.
+     * @param onResult Called with the result while the response message is handled, before the next message
      * @returns Promise that resolves with the command result
      * @throws Error if the command times out or fails
      */
@@ -652,6 +851,7 @@ export class MatterClient {
         require_schema: number | undefined = undefined,
         args: APICommands[T]["requestArgs"],
         timeout = this.commandTimeout,
+        onResult?: (result: APICommands[T]["response"]) => void,
     ): Promise<APICommands[T]["response"]> {
         if (require_schema && this.serverInfo.schema_version < require_schema) {
             throw new InvalidServerVersion(
@@ -692,7 +892,13 @@ export class MatterClient {
 
             // Type-erased storage: resolve/reject are stored as unknown handlers
             this.result_futures[messageId] = {
-                resolve,
+                resolve:
+                    onResult === undefined
+                        ? resolve
+                        : result => {
+                              onResult(result);
+                              resolve(result);
+                          },
                 reject,
                 timeoutId,
             };
@@ -732,6 +938,20 @@ export class MatterClient {
         }
     }
 
+    /** The server ends every subscription of a connection when it closes, without a `subscription_ended`. */
+    private _endAllSubscriptions(): void {
+        const listeners = [...this.subscriptionListeners.values()];
+        this.subscriptionListeners.clear();
+        for (const listener of listeners) {
+            // Runs inside disconnect and the connection-lost handling, which must complete.
+            try {
+                listener.ended?.();
+            } catch (error) {
+                console.error("Subscription listener failed on end", error);
+            }
+        }
+    }
+
     /**
      * Reject all pending commands with a ConnectionClosedError.
      * Called when the connection is closed or lost.
@@ -752,6 +972,7 @@ export class MatterClient {
             msg => this._handleIncomingMessage(msg as IncomingMessage),
             () => {
                 this._rejectAllPendingCommands();
+                this._endAllSubscriptions();
                 this.fireEvent("connection_lost");
             },
         );
@@ -760,6 +981,7 @@ export class MatterClient {
     disconnect(clearStorage = false) {
         // Reject all pending commands before disconnecting
         this._rejectAllPendingCommands();
+        this._endAllSubscriptions();
         // disconnect from the server
         if (this.connection && this.connection.connected) {
             this.connection.disconnect();
@@ -796,7 +1018,11 @@ export class MatterClient {
             const details = msg.details ?? "";
             this._rejectPendingCommand(
                 msg.message_id,
-                new ServerCommandError(details !== "" ? details : `Server error ${msg.error_code}`, msg.error_code),
+                new ServerCommandError(details !== "" ? details : `Server error ${msg.error_code}`, msg.error_code, {
+                    status: msg.status,
+                    clusterStatus: msg.cluster_status,
+                    reason: msg.reason,
+                }),
             );
             return;
         }
@@ -896,6 +1122,21 @@ export class MatterClient {
             for (const listener of this.nodeEventListeners) {
                 listener(event.data);
             }
+            return;
+        }
+
+        if (event.event === "subscription_report") {
+            this.subscriptionListeners
+                .get(subscriptionKey(event.data.node_id, event.data.subscription_id))
+                ?.report(event.data);
+            return;
+        }
+
+        if (event.event === "subscription_ended") {
+            const key = subscriptionKey(event.data.node_id, event.data.subscription_id);
+            const listener = this.subscriptionListeners.get(key);
+            this.subscriptionListeners.delete(key);
+            listener?.ended?.();
             return;
         }
     }

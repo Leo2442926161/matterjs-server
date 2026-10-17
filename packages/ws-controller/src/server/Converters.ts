@@ -4,10 +4,20 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { matterNameToWireField } from "@matter-server/ws-client";
-import { AttributeId, Bytes, camelize, ClusterId, isObject, Logger } from "@matter/main";
+import { matterNameToWireField, type MatterNodeEvent, type PathStatus } from "@matter-server/ws-client";
+import { AttributeId, Bytes, camelize, ClusterId, isObject, Logger, NodeId } from "@matter/main";
 import { ClusterModel, FieldModel, FieldValue, ValueModel } from "@matter/main/model";
-import { EndpointNumber, MATTER_EPOCH_OFFSET_S, MATTER_EPOCH_OFFSET_US } from "@matter/main/types";
+import {
+    EndpointNumber,
+    EventId,
+    MATTER_EPOCH_OFFSET_S,
+    MATTER_EPOCH_OFFSET_US,
+    Status,
+    ValidationError,
+} from "@matter/main/types";
+import type { EventChange, EventOccurrence } from "../controller/PeerChangeBus.js";
+import { ClusterMap } from "../model/ModelMapper.js";
+import { ServerError } from "../types/WebSocketMessageTypes.js";
 
 export { parseBigIntAwareJson, toBigIntAwareJson } from "@matter-server/ws-client";
 
@@ -415,7 +425,6 @@ function convertMatterToWebSocket(
         return null;
     }
     if (model === undefined) {
-        // Unknown attributes: simple type conversions only
         if (Bytes.isBytes(value)) {
             return Bytes.toBase64(value);
         }
@@ -423,7 +432,16 @@ function convertMatterToWebSocket(
             // Best-effort: recursively convert elements without schema
             return value.map(v => convertMatterToWebSocket(v, undefined, clusterModel, tagBased));
         }
-        if (isObject(value) || !PRIMITIVE_TYPEOF.has(typeof value)) {
+        // matter.js decodes an unmodeled TLV structure to an object keyed by tag number
+        if (isObject(value)) {
+            return Object.fromEntries(
+                Object.entries(value).map(([tag, member]) => [
+                    tag,
+                    convertMatterToWebSocket(member, undefined, clusterModel, tagBased),
+                ]),
+            );
+        }
+        if (!PRIMITIVE_TYPEOF.has(typeof value)) {
             return null;
         }
         return value;
@@ -643,6 +661,20 @@ export function buildAttributePath(endpointId: number, clusterId: number, attrib
     return `${endpointId}/${clusterId}/${attributeId}`;
 }
 
+/** The numbers of a path; non-numeric parts and the wildcard values 0xffff / 0xffffffff are undefined. */
+function pathNumbersOf(path: string) {
+    const [endpointStr, clusterStr, thirdStr] = path.split("/");
+    const numberOf = (part: string | undefined, wildcard: number) => {
+        const value = part !== undefined && /^\d+$/.test(part) ? parseInt(part, 10) : undefined;
+        return value === wildcard ? undefined : value;
+    };
+    return {
+        endpoint: numberOf(endpointStr, 0xffff),
+        cluster: numberOf(clusterStr, 0xffffffff),
+        third: numberOf(thirdStr, 0xffffffff),
+    };
+}
+
 /**
  * Parse an attribute path string into its components.
  * Supports wildcards (*) for endpoint, cluster, and attribute IDs.
@@ -650,32 +682,105 @@ export function buildAttributePath(endpointId: number, clusterId: number, attrib
  *
  * @param path - Attribute path string in format "endpoint/cluster/attribute"
  * @returns Object with endpointId, clusterId, attributeId - each undefined if wildcard
+ * @throws ServerError with InvalidArguments when a number is not a valid id of its kind
  */
 export function splitAttributePath(path: string): {
     endpointId: EndpointNumber | undefined;
     clusterId: ClusterId | undefined;
     attributeId: AttributeId | undefined;
 } {
-    const [endpointStr, clusterStr, attributeStr] = path.split("/");
+    const { endpoint, cluster, third } = pathNumbersOf(path);
+    return idsOf(path, () => ({
+        endpointId: endpoint !== undefined ? EndpointNumber(endpoint) : undefined,
+        clusterId: cluster !== undefined ? ClusterId(cluster) : undefined,
+        attributeId: third !== undefined ? AttributeId(third) : undefined,
+    }));
+}
 
-    // Non-numeric values (like "*") are treated as wildcards (undefined)
-    let endpointNum = /^\d+$/.test(endpointStr) ? parseInt(endpointStr, 10) : undefined;
-    let clusterNum = /^\d+$/.test(clusterStr) ? parseInt(clusterStr, 10) : undefined;
-    let attributeNum = /^\d+$/.test(attributeStr) ? parseInt(attributeStr, 10) : undefined;
+/** The matter.js id types reject an id out of range for its kind. */
+function idsOf<T>(path: string, ids: () => T): T {
+    try {
+        return ids();
+    } catch (error) {
+        if (error instanceof ValidationError) {
+            throw ServerError.invalidArguments(`Invalid id in path "${path}": ${error.message}`);
+        }
+        throw error;
+    }
+}
 
-    if (endpointNum !== undefined && endpointNum === 0xffff) {
-        endpointNum = undefined;
-    }
-    if (clusterNum !== undefined && clusterNum === 0xffffffff) {
-        clusterNum = undefined;
-    }
-    if (attributeNum !== undefined && attributeNum === 0xffffffff) {
-        attributeNum = undefined;
+/**
+ * True when `path` has exactly `segments` parts, each a decimal number or `*`. {@link splitAttributePath} reads any
+ * other part as a wildcard, so a typo would widen the request.
+ */
+export function isWellFormedPath(path: string, segments: number) {
+    const parts = path.split("/");
+    return parts.length === segments && parts.every(part => /^(\d+|\*)$/.test(part));
+}
+
+/** A status path in the request format; a wildcard the device left in the path stays "*". */
+export function statusPathOf(...ids: (number | undefined)[]) {
+    return ids.map(id => id ?? "*").join("/");
+}
+
+/** The wire `PathStatus` of a Matter status; `cluster_status` only when the device sent one. */
+export function pathStatusOf({ status, clusterStatus }: { status: Status; clusterStatus?: number }): PathStatus {
+    return clusterStatus === undefined ? { status } : { status, cluster_status: clusterStatus };
+}
+
+/**
+ * Parse an event path string ("endpoint/cluster/event") into its components, with the same wildcard rules as
+ * {@link splitAttributePath}.
+ *
+ * @throws ServerError with InvalidArguments when a number is not a valid id of its kind
+ */
+export function splitEventPath(path: string): {
+    endpointId: EndpointNumber | undefined;
+    clusterId: ClusterId | undefined;
+    eventId: EventId | undefined;
+} {
+    const { endpoint, cluster, third } = pathNumbersOf(path);
+    return idsOf(path, () => ({
+        endpointId: endpoint !== undefined ? EndpointNumber(endpoint) : undefined,
+        clusterId: cluster !== undefined ? ClusterId(cluster) : undefined,
+        eventId: third !== undefined ? EventId(third) : undefined,
+    }));
+}
+
+/** Convert one event occurrence into the `node_event` wire shape. */
+export function convertEventToWebSocket(
+    nodeId: NodeId,
+    path: EventChange["path"],
+    event: EventOccurrence,
+): MatterNodeEvent {
+    const { endpointId, clusterId, eventId } = path;
+
+    let timestamp: number | bigint;
+    let timestampType: number;
+    if (event.epochTimestamp !== undefined) {
+        timestamp = event.epochTimestamp;
+        timestampType = 1; // Epoch
+    } else if (event.systemTimestamp !== undefined) {
+        timestamp = event.systemTimestamp;
+        timestampType = 0; // System
+    } else {
+        timestamp = Date.now();
+        timestampType = 2; // POSIX (fallback)
     }
 
+    const clusterData = ClusterMap[clusterId];
     return {
-        endpointId: endpointNum !== undefined ? EndpointNumber(endpointNum) : undefined,
-        clusterId: clusterNum !== undefined ? ClusterId(clusterNum) : undefined,
-        attributeId: attributeNum !== undefined ? AttributeId(attributeNum) : undefined,
+        node_id: nodeId,
+        endpoint_id: endpointId,
+        cluster_id: clusterId,
+        event_id: eventId,
+        event_number: event.eventNumber,
+        priority: event.priority,
+        timestamp,
+        timestamp_type: timestampType,
+        data:
+            event.data !== undefined
+                ? convertMatterToWebSocketNameBased(event.data, clusterData?.events[eventId], clusterData?.model)
+                : null,
     };
 }

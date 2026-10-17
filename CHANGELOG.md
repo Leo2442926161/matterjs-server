@@ -22,6 +22,19 @@ This page shows a detailed overview of the changes between versions without the 
 - Enhancement: Finishes the migration to the new matter.js controller API
 - Enhancement: `send_webrtc_provider_command` also relays `ProvideAnswer` and `ProvideIceCandidates`
 - Enhancement: (@RaHehl) `open_commissioning_window` also returns `discriminator`, `vendor_id`, `product_id` and `commissioning_timeout` (seconds) as reported by matter.js, so clients can hand the data to another ecosystem without decoding the QR code.
+- Enhancement: Adds CLI flag `--revocation-sets-dir` (env `REVOCATION_SETS_DIR`): the server installs the device attestation revocation sets from that directory at every start, and refuses devices whose certificates they list. See [README](README.md#installing-device-attestation-revocation-sets)
+- Enhancement: Adds CLI flag `--dcl-offline` (env `DCL_OFFLINE`): the server never contacts the DCL, uses the bundled DCL data and stored certificates, and skips the DCL revocation lookups. Revocation sets from `--revocation-sets-dir` still apply
+- Enhancement: Adds CLI flag `--disable-auto-subscription` (env `DISABLE_AUTO_SUBSCRIPTION`): the server does not subscribe to nodes and runs no background jobs on its own. Only for special use cases. See [docs/cli.md](docs/cli.md#disabled-auto-subscription)
+- Enhancement: Adds the WebSocket commands `read`, `subscribe`, `unsubscribe`, `enable_auto_subscription` and `disable_auto_subscription` for generic Matter reads and subscriptions in the `--disable-auto-subscription` mode. See [docs/websockets_api.md](docs/websockets_api.md#subscriptions-and-generic-read)
+- Enhancement: Adds the WebSocket command `parse_onboarding_payload` to decode a QR code or manual pairing code without contacting a device
+- Enhancement: When device attestation refuses a device, the commissioning error also names the failed checks, e.g. `Device attestation refused: CertificateRevoked: Device Attestation Certificate has been revoked`
+- Enhancement: `commission_with_code` and `commission_on_network` take an optional `discovery_timeout_s`
+- Enhancement: Error responses carry the device's Matter status (`status`, `cluster_status`), commissioning errors a `reason`, and `write_attribute` results the cluster-specific status
+- Enhancement: Adds the WebSocket command `batched_device_commands` to send several commands to one node in a single InvokeRequest
+- Enhancement: Adds the CHIP UnitTesting test cluster (0xFFF1FC05) as custom cluster that the controller certification suite uses
+- Enhancement: `write_attribute` takes a wildcard endpoint to write all endpoints of a node in one request, and `timed_request_timeout_ms` for a timed write
+- Enhancement: The ws-client has `commissionOnNetwork`, and `deviceCommand` takes an options object with `timedRequestTimeoutMs` and `interactionTimeoutMs` (a number still sets the client timeout)
+- Enhancement: `--port 0` binds a free port, shown in the startup log line `Webserver listening on …`
 - Enhancement: Dashboard network view uses the Thread 1.4 role names: a Thread Router is shown as "Mesh Extender" and a REED as "Standby Mesh Extender". External (non-fabric) neighbors, whose role is only inferred from rx-on-when-idle, are now labeled "Always-on device" instead of a routing role. Wire values and the `ThreadRoutingRole` enum keep the Matter spec names
 - Enhancement: (@cyberb) `--listen-address` (env `LISTEN_ADDRESS`) accepts an absolute unix socket path, so the WebSocket API and dashboard can be served on a local socket, alone or next to TCP addresses; a socket file left behind by an unclean shutdown is replaced on the next start, and the Docker health check queries the socket
 - Enhancement: (@cyberb) The Python client connects over a unix socket when given a `unix://<path>` server URL, including OTA image uploads
@@ -52,6 +65,8 @@ This page shows a detailed overview of the changes between versions without the 
 - Adjustment: `send_webrtc_provider_command` checks `node_id`, `endpoint_id` and every payload field against the cluster definition and refuses a bad one with error 8 instead of failing later or silently dropping data. It accepts the documented `ice_servers` shape and the key spellings `webrtc_callback` uses, and no longer drops streams before the camera's first report
 - Adjustment: A node's availability follows its connection state. The former 3-minute grace period after a connection loss is gone, so an unreachable node is reported as soon as matter.js gives up on reaching it rather than after a fixed timer on top
 - Adjustment: Dashboard network view uses the Thread 1.4 role names
+- Adjustment: `device_command` refuses an invalid `timed_request_timeout_ms` or `interaction_timeout_ms` with error 8
+- Adjustment: Structured values of clusters, attributes and events the server does not know are sent keyed by their TLV tags instead of as `null`
 - Adjustment: `write_attribute`, `set_acl_entry` and `set_node_binding` always send the write to the node and report the node's answer, also when the value equals the current one
 - Fix: The Dashboard shows the data type of custom cluster attributes and of attributes of derived clusters (Mode clusters, Bridged Device Basic Information) instead of `unknown`
 - Fix: `webrtc_callback` events the camera sends while `send_webrtc_provider_command` is still running are no longer lost
@@ -60,7 +75,13 @@ This page shows a detailed overview of the changes between versions without the 
 - Fix: A command sent before the controller finished starting fails with the SDK stack error code instead of a generic error
 - Fix: The server's debug log masks Wi-Fi passphrases, Thread datasets, setup codes, credential material in `device_command` requests, TURN credentials and SDP ICE credentials, and no longer logs the `open_commissioning_window` response. `device_command` responses are still logged in full. The TypeScript client logs very long strings as their length
 - Fix: The Python client delivers `webrtc_callback` and the camera events to subscribers registered with `node_filter`, as Home Assistant does
-- Fix: A wrong pairing code is reported as such instead of as a generic commissioning failure, so a client can ask for the code again
+- Fix: A wrong pairing code is reported as such instead of as a generic commissioning failure, so a client can ask for the code again. A pairing code that cannot be decoded fails with `InvalidArguments`
+- Fix: Commissioning with a pairing code that names a vendor and product skips a device whose advertisement names another vendor or product
+- Fix: A device that has only its root endpoint is commissioned and reported with its data
+- Fix: `commission_on_network` respects `filter_type` 3 (vendor) and 4 (device type)
+- Fix: `device_command` respects `interaction_timeout_ms`, and refuses a command the cluster does not have or fields that cannot be encoded with error 8
+- Fix: Identical commands sent in parallel by different clients each reach the device
+- Fix: `read_attribute` and `write_attribute` refuse a path with an id that is invalid for its kind (for example cluster 32768) with `InvalidArguments`
 - Fix: Dashboard shows manufacturer-specific enum values (vendor mode tags, operational and error states, closure errors) as "Manufacturer 0x…"
 - Fix: (@RAR) List values of decorator-defined custom clusters are converted in both directions, so bytes inside a list (Aqara `SetZones`) reach the device as bytes instead of strings. The same fix sends `SupportedModes` of the derived Mode clusters (RVC Run/Clean, Dishwasher, Laundry Washer, Oven, Microwave Oven, Refrigerator, Device Energy Management, EVSE and Water Heater Mode) keyed by tag like every other attribute value, instead of keyed by field name
 - Fix: (@RAR) The Python client generator resolves struct, signed integer, list and response types of decorator-defined custom clusters; the `int32` attributes `DraftElectricalMeasurementCluster.activePower` and `ThirdRealityMeteringCluster.instantaneousDemand` are now generated as signed
