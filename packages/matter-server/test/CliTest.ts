@@ -31,6 +31,7 @@ describe("cli", () => {
         "DCL_OFFLINE",
         "DISABLE_DCL_SEED",
         "REVOCATION_SETS_DIR",
+        "CERTIFICATES_DIR",
     ];
     const savedEnv = new Map<string, string | undefined>();
 
@@ -238,6 +239,22 @@ describe("cli", () => {
                 true,
                 true,
             ]);
+        });
+    });
+
+    describe("--certificates-dir", () => {
+        it("is unset by default", () => {
+            expect(parseCliArgs(argv()).certificatesDir).to.equal(null);
+        });
+
+        it("is set by the option and the environment", () => {
+            expect(parseCliArgs(argv("--certificates-dir", "/certs")).certificatesDir).to.equal("/certs");
+            process.env.CERTIFICATES_DIR = "/env-certs";
+            try {
+                expect(parseCliArgs(argv()).certificatesDir).to.equal("/env-certs");
+            } finally {
+                delete process.env.CERTIFICATES_DIR;
+            }
         });
     });
 
